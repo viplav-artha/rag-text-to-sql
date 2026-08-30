@@ -1,1 +1,7 @@
 # Add dependencies here, e.g. pip freeze > requirements.txt
+python-dotenv
+langchain-aws
+sqlalchemy
+psycopg[binary]
+pgvector
+redis
