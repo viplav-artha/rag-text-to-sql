@@ -15,10 +15,11 @@ latency/cost on repeated or similar questions. The whole thing is exposed as a F
 Tech stack: Python, LangChain, LangGraph, langchain-aws (Bedrock chat LLM), sentence-transformers
 (local embeddings), FastAPI, SQLAlchemy, Neon Postgres + pgvector, Redis.
 
-**Multi-tenant from the start:** every RAG knowledge row (`schema_chunks`, `few_shot_examples`,
-`company_profiles`) is scoped by an explicit `company` field, and retrieval always filters by it
-before doing similarity search. Only one company exists today — **Futwork** (a telecalling/
-voice-BPO platform; see its stored profile in `company_profiles`), whose real data lives in
+**Multi-tenant from the start:** every RAG knowledge row (`rag.schema_chunks`, `rag.few_shot_examples`,
+`rag.company_profiles` — all three live in a dedicated `rag` Postgres schema, not `public`) is
+scoped by an explicit `company` field, and retrieval always filters by it before doing similarity
+search. Only one company exists today — **Futwork** (a telecalling/
+voice-BPO platform; see its stored profile in `rag.company_profiles`), whose real data lives in
 `portfolio.futwork_vs_aop` in Neon — but the schema is built so a second company's data can be
 added later (a similarly-shaped view joining that company's MIS/AOP tables) without one
 company's questions ever retrieving another's context.
@@ -70,7 +71,12 @@ Additionally, `app/main.py` was built early (out of build order, at the
 user's request) as a minimal FastAPI test harness — one `POST /query`
 endpoint calling `graph.invoke()` directly, verified with a real HTTP
 request. This is not the final lesson-18 file (no caching/schemas/routing
-yet). Waiting on user review/go-ahead before starting lesson 15
+yet). All three RAG bookkeeping tables (`company_profiles`,
+`few_shot_examples`, `schema_chunks`) were then moved from `public` into a
+dedicated `rag` schema (still the same Neon RAG-branch database) at the
+user's request, via `__table_args__ = {"schema": "rag"}` on all three ORM
+models — re-verified end-to-end (retrieval + the live `/query` endpoint)
+after the move. Waiting on user review/go-ahead before starting lesson 15
 (`app/services/query_service.py`), which wraps the compiled graph with
 Redis cache check/write.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
@@ -132,15 +138,18 @@ package markers are omitted from both (see the Maintenance instructions below).
    `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed)
 9. `app/rag/embeddings.py` — `get_embeddings()`, cached `HuggingFaceEmbeddings`
    wrapper around `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim)
-10. `app/rag/schema_store.py` — `SchemaChunk` ORM model (`vector(384)` column),
-    `add_schema_chunk()`, `search_schema()` (pgvector cosine-distance search).
-    **Corrected post-hoc**: added `company` and `schema_name` fields/params so
-    chunks record which company and which Postgres schema (`portfolio`, not
-    `public`) they describe, and `search_schema()` filters by `company` before
+10. `app/rag/schema_store.py` — `SchemaChunk` ORM model (`vector(384)` column,
+    lives in the `rag` Postgres schema via `__table_args__`), `add_schema_chunk()`,
+    `search_schema()` (pgvector cosine-distance search). **Corrected post-hoc**:
+    added `company` and `schema_name` fields/params so chunks record which
+    company and which Postgres schema (`portfolio`, not `public` — this is a
+    separate concept from the `rag` schema the table itself lives in, see
+    above) they describe, and `search_schema()` filters by `company` before
     similarity ordering.
 11. `app/rag/example_store.py` — `FewShotExample` ORM model (embeds `question`
-    only), `add_example()`, `search_examples()` (top_k=3 by default).
-    **Corrected post-hoc**: added `company` field/param, filtered the same way.
+    only, also in the `rag` schema), `add_example()`, `search_examples()`
+    (top_k=3 by default). **Corrected post-hoc**: added `company` field/param,
+    filtered the same way.
 12. `app/rag/retriever.py` — `RetrievedContext` dataclass (+ `to_prompt_text()`),
     `retrieve_context()` combining schema + example search into one call.
     **Corrected post-hoc**: takes `company`, also fetches the company's business
@@ -148,7 +157,8 @@ package markers are omitted from both (see the Maintenance instructions below).
     section in the prompt text; schema lines now show `schema_name.table_name.column`.
 13. `app/rag/company_profile.py` — `CompanyProfile` ORM model (`company` primary
     key, `profile` text, no embedding column — fetched by exact company match,
-    not similarity search), `get_company_profile()`, `upsert_company_profile()`
+    not similarity search, also in the `rag` schema), `get_company_profile()`,
+    `upsert_company_profile()`
 14. `data/companies/futwork.py` — Futwork's knowledge data: `PROFILE`,
     `EXCLUDED_COLUMNS`, `PER_CLIENT_TEMPLATES` (2), `METRIC_DESCRIPTIONS` (67),
     `FEW_SHOT_EXAMPLES` (5) — pure data, no logic
@@ -237,12 +247,14 @@ imports the three RAG store modules for table registration —
   were created ad hoc via `Base.metadata.create_all(engine)` during lesson 6's
   verification, run manually rather than as part of an app startup hook (that
   hook is still planned for `main.py`, lesson 18). A production version would
-  want real migrations instead of `create_all()` — this has bitten us twice
-  now: once for the multi-tenancy correction (empty tables, no data lost),
-  and again in lesson 12 for the `is_per_entity` column (177 real rows
-  existed by then — DROP + recreate + re-run `ingest_knowledge.py` worked
-  cleanly only because that script is idempotent; this would be a real
-  migration in any system with actual production data at stake).
+  want real migrations instead of `create_all()` — this has bitten us three
+  times now: once for the multi-tenancy correction (empty tables, no data
+  lost), again in lesson 12 for the `is_per_entity` column, and again when
+  the three RAG tables were moved from `public` into a dedicated `rag`
+  schema (177 real rows existed each time — DROP + recreate + re-run
+  `ingest_knowledge.py` worked cleanly only because that script is
+  idempotent; this would be a real migration in any system with actual
+  production data at stake).
 - `Base.metadata.create_all()` only creates tables for models that have
   actually been imported somewhere first (that's what registers them on
   `Base.metadata`). `app/rag/__init__.py` now imports all three RAG store

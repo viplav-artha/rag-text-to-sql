@@ -8,6 +8,7 @@ from app.rag.embeddings import get_embeddings
 
 class FewShotExample(Base):
     __tablename__ = "few_shot_examples"
+    __table_args__ = {"schema": "rag"}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company: Mapped[str] = mapped_column(String(64))
