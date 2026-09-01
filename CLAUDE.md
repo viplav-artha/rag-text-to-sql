@@ -53,15 +53,21 @@ tests are expected, not just a working demo.
   command first.
 
 ## Current status
-Stage: Lesson 10 (`scripts/ingest_knowledge.py` + `data/companies/futwork.py`)
-done, walked through, and run for real against the Neon RAG branch: 177 schema
-chunks (67 confirmed metrics + 55 clients × 2 per-client templates, zero
-skipped/unknown columns) and 5 few-shot examples ingested for company
-`futwork`. Spot-checked retrieval quality on 3 real questions — all returned
-sensible top matches. The RAG knowledge base for Futwork is now real and
-complete (profile + schema + examples). Waiting on user review/go-ahead before
-starting lesson 11 (`app/graph/state.py`), which begins the LangGraph part of
-the build.
+Stage: Lesson 14 (`app/graph/graph.py`) done — `langgraph` installed and
+wired for real. All 5 nodes (retrieve, generate, validate, execute, format)
+are now assembled into a compiled `StateGraph` with a conditional
+validate→(generate|execute) retry edge, capped at `_MAX_RETRIES = 2`.
+Verified two ways: `graph.invoke({...})` end-to-end on a real question
+(correctly answered "INR 22,063,632" via the single `.invoke()` call, no
+manual node chaining needed), and the routing function's boundary conditions
+tested directly (no-error → execute, error-with-retries-left → generate,
+error-retries-exhausted → execute, where lesson 13's defense-in-depth guard
+catches it). The full retrieve → generate → validate → execute → format
+pipeline this represents was itself verified end-to-end in lessons 12-13,
+with two real bugs found and fixed there: lowercase `month_name` values, and
+`format_answer_node` originally defaulting to USD instead of INR. Waiting on
+user review/go-ahead before starting lesson 15 (`app/services/query_service.py`),
+which wraps this compiled graph with Redis cache check/write.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
 
 ## Planned build order
@@ -85,72 +91,99 @@ Subject to adjustment as we go — update in place, don't just append.
     data module that populate all three RAG stores with real Futwork data (67 confirmed metric
     descriptions + per-client billing/minutes columns via live column introspection + 5 few-shot
     examples). Run for real; 177 schema chunks + 5 examples ingested, zero skipped columns.
-11. **NEXT** — `app/graph/state.py` — LangGraph shared state schema (TypedDict)
-12. `app/graph/nodes.py` — LangGraph nodes: retrieve context, generate SQL, validate SQL
-13. `app/graph/execute_node.py` — LangGraph node: execute validated SQL, format result
-14. `app/graph/graph.py` — assembles the StateGraph, wires nodes + conditional routing
-15. `app/services/query_service.py` — orchestration: Redis cache check → run graph → cache write
+11. **DONE** — `app/graph/state.py` — LangGraph shared state schema (TypedDict)
+12. **DONE** — `app/graph/nodes.py` — LangGraph nodes: retrieve context, generate SQL, validate SQL
+13. **DONE** — `app/graph/execute_node.py` — LangGraph node: execute validated SQL, format result
+14. **DONE** — `app/graph/graph.py` — assembles the StateGraph, wires nodes + conditional routing
+15. **NEXT** — `app/services/query_service.py` — orchestration: Redis cache check → run graph → cache write
 16. `app/api/schemas.py` — FastAPI request/response Pydantic models
 17. `app/api/routes.py` — FastAPI router: `POST /query` endpoint
 18. `app/main.py` — FastAPI app instance, mounts routers, startup/shutdown hooks
 
 ## Files created so far (chronological)
+Matches NOTES.md's Timeline numbering exactly — empty/near-empty `__init__.py`
+package markers are omitted from both (see the Maintenance instructions below).
+
 1. `.gitignore` — standard Python ignore rules (created via init-project skill)
 2. `README.md` — starter project README (created via init-project skill)
 3. `requirements.txt` — dependency manifest, empty initially (created via init-project skill)
 4. `.env` — local credentials file (git-ignored), created by the user, populated as
    each service's credentials are provided
-5. `app/__init__.py` — empty package marker for the `app` package
-6. `app/core/__init__.py` — empty package marker for the `app.core` package
-7. `app/core/llm.py` — `get_llm()`, builds a `ChatBedrockConverse` LLM client from
+5. `app/core/llm.py` — `get_llm()`, builds a `ChatBedrockConverse` LLM client from
    env-configured model ID / region / AWS profile
-8. `app/core/config.py` — `get_settings()`, a cached `Settings` dataclass holding
+6. `app/core/config.py` — `get_settings()`, a cached `Settings` dataclass holding
    `DATABASE_URL`, `REDIS_URL`, `EMBEDDING_MODEL_NAME`, `CACHE_TTL_SECONDS`
    (field renamed from `embedding_model_id`/`BEDROCK_EMBEDDING_MODEL_ID` in
    lesson 5 once embeddings moved off Bedrock to a local model)
-9. `app/core/db.py` — SQLAlchemy engine/session (psycopg v3 driver), `Base` for
+7. `app/core/db.py` — SQLAlchemy engine/session (psycopg v3 driver), `Base` for
    ORM models, `get_db()` (FastAPI dependency), `db_session()` (context manager),
    `init_pgvector_extension()`
-10. `app/core/cache.py` — Redis client singleton, `make_cache_key()`,
-    `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed)
-11. `app/rag/__init__.py` — empty package marker for the `app.rag` package
-12. `app/rag/embeddings.py` — `get_embeddings()`, cached `HuggingFaceEmbeddings`
-    wrapper around `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim)
-13. `app/rag/schema_store.py` — `SchemaChunk` ORM model (`vector(384)` column),
+8. `app/core/cache.py` — Redis client singleton, `make_cache_key()`,
+   `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed)
+9. `app/rag/embeddings.py` — `get_embeddings()`, cached `HuggingFaceEmbeddings`
+   wrapper around `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim)
+10. `app/rag/schema_store.py` — `SchemaChunk` ORM model (`vector(384)` column),
     `add_schema_chunk()`, `search_schema()` (pgvector cosine-distance search).
     **Corrected post-hoc**: added `company` and `schema_name` fields/params so
     chunks record which company and which Postgres schema (`portfolio`, not
     `public`) they describe, and `search_schema()` filters by `company` before
     similarity ordering.
-14. `app/rag/example_store.py` — `FewShotExample` ORM model (embeds `question`
+11. `app/rag/example_store.py` — `FewShotExample` ORM model (embeds `question`
     only), `add_example()`, `search_examples()` (top_k=3 by default).
     **Corrected post-hoc**: added `company` field/param, filtered the same way.
-15. `app/rag/retriever.py` — `RetrievedContext` dataclass (+ `to_prompt_text()`),
+12. `app/rag/retriever.py` — `RetrievedContext` dataclass (+ `to_prompt_text()`),
     `retrieve_context()` combining schema + example search into one call.
     **Corrected post-hoc**: takes `company`, also fetches the company's business
     profile via `company_profile.py` and includes it as a "Business context"
     section in the prompt text; schema lines now show `schema_name.table_name.column`.
-16. `app/rag/company_profile.py` — `CompanyProfile` ORM model (`company` primary
+13. `app/rag/company_profile.py` — `CompanyProfile` ORM model (`company` primary
     key, `profile` text, no embedding column — fetched by exact company match,
     not similarity search), `get_company_profile()`, `upsert_company_profile()`
-17. `data/__init__.py` — empty package marker for the `data` package
-18. `data/companies/__init__.py` — empty package marker for the `data.companies` package
-19. `scripts/__init__.py` — empty package marker for the `scripts` package
-20. `data/companies/futwork.py` — Futwork's knowledge data: `PROFILE`,
+14. `data/companies/futwork.py` — Futwork's knowledge data: `PROFILE`,
     `EXCLUDED_COLUMNS`, `PER_CLIENT_TEMPLATES` (2), `METRIC_DESCRIPTIONS` (67),
     `FEW_SHOT_EXAMPLES` (5) — pure data, no logic
-21. `scripts/ingest_knowledge.py` — introspects `portfolio.futwork_vs_aop`'s
+15. `scripts/ingest_knowledge.py` — introspects `portfolio.futwork_vs_aop`'s
     real columns, matches each against `futwork.py`'s data (per-client pattern
     or exact metric), and idempotently (re)populates all three RAG tables for
     company `futwork`
+16. `app/graph/state.py` — `GraphState` TypedDict, the shared object every
+    LangGraph node reads/writes; only `company`/`question` are required,
+    every other field is `NotRequired` and filled in as the graph runs
+17. `app/graph/nodes.py` — `retrieve_node()`, `generate_sql_node()`,
+    `validate_sql_node()` — the retrieve/generate/validate stages of the
+    pipeline, verified end-to-end against real Bedrock + Neon
+18. `app/graph/execute_node.py` — `execute_sql_node()` (statement timeout,
+    automatic row limit, Decimal/date serialization, defense-in-depth
+    validation guard), `format_answer_node()` (LLM narrates results into
+    plain English) — full 5-stage pipeline now verified end-to-end
+19. `app/graph/graph.py` — `build_graph()` assembles all 5 nodes into a
+    compiled `StateGraph`, `_route_after_validation()` conditional edge
+    (retry generate on validation failure, capped at `_MAX_RETRIES = 2`),
+    module-level `graph` ready for `.invoke()`
+
+(Package markers actually created, for completeness, but untracked by the
+numbering above: `app/__init__.py`, `app/core/__init__.py`,
+`app/rag/__init__.py` — no longer empty as of the multi-tenancy correction,
+imports the three RAG store modules for table registration —
+`data/__init__.py`, `data/companies/__init__.py`, `scripts/__init__.py`,
+`app/graph/__init__.py`.)
 
 ## Environment
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
 - Run (once `app/main.py` exists): `uvicorn app.main:app --reload`
 - External services required, credentials supplied via `.env`:
-  - AWS Bedrock (LLM + embeddings) — `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`,
-    `AWS_PROFILE`, `LLM_TEMPERATURE`
+  - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —
+    `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`, `AWS_PROFILE`,
+    `LLM_TEMPERATURE`. **Set in `.env` as of lesson 12**: `AWS_PROFILE=
+    "Artha-stg-dev"`, `BEDROCK_CHAT_MODEL_ID="amazon.nova-pro-v1:0"` (not the
+    `us.`-prefixed cross-region inference profile ID — the direct model ID,
+    since that's what this account/role has `bedrock:InvokeModel` access to),
+    `AWS_REGION="us-east-1"`. The `Artha-stg-dev` role initially had zero
+    Bedrock permissions (`AccessDeniedException` on both `InvokeModel` and
+    `ListFoundationModels`) — required an IAM policy update before this
+    worked; if credentials/permissions ever need rotating, re-verify with
+    `aws sts get-caller-identity --profile Artha-stg-dev` first.
   - Neon Postgres (`RAG` branch specifically, not `dev`/`production` —
     `NEON_BRANCH=RAG` in `.env`; pgvector extension enabled) — `DATABASE_URL`.
     Paste Neon's connection string as-is (`postgresql://...` or `postgres://...`);
@@ -185,10 +218,12 @@ Subject to adjustment as we go — update in place, don't just append.
   were created ad hoc via `Base.metadata.create_all(engine)` during lesson 6's
   verification, run manually rather than as part of an app startup hook (that
   hook is still planned for `main.py`, lesson 18). A production version would
-  want real migrations instead of `create_all()` — this bit us once already:
-  when `schema_chunks`/`few_shot_examples` needed new columns (the
-  multi-tenancy correction), the fix was DROP + recreate the (empty) tables,
-  which only works because nothing real had been ingested yet.
+  want real migrations instead of `create_all()` — this has bitten us twice
+  now: once for the multi-tenancy correction (empty tables, no data lost),
+  and again in lesson 12 for the `is_per_entity` column (177 real rows
+  existed by then — DROP + recreate + re-run `ingest_knowledge.py` worked
+  cleanly only because that script is idempotent; this would be a real
+  migration in any system with actual production data at stake).
 - `Base.metadata.create_all()` only creates tables for models that have
   actually been imported somewhere first (that's what registers them on
   `Base.metadata`). `app/rag/__init__.py` now imports all three RAG store
@@ -204,15 +239,47 @@ Subject to adjustment as we go — update in place, don't just append.
   (5 examples) and avoids "most recent month" style queries, since
   `month_name` is text (not a date/number) and sorts alphabetically, not
   chronologically — a real trend/"last N months" query needs a month-name-
-  to-number `CASE` mapping. Worth solving properly once the LangGraph SQL-
-  generation node (lesson 12) is built, rather than baking a wrong pattern
-  into the examples now.
-- Retrieval quality is good on the top 1-2 matches for a given question but
-  can include weaker/noisier matches further down `top_k` (e.g. asking about
-  "runway" returned `runway_in_months` correctly first, followed by less
-  relevant columns at ranks 2-4) — expected behavior of a small local
-  embedding model, not a bug; may be worth tuning `schema_top_k` or upgrading
-  the embedding model later if this proves to matter in practice.
+  to-number `CASE` mapping. Lesson 12 (`generate_sql_node`) does not yet
+  solve this — a question asking for "the last 3 months" would currently
+  risk generating an `ORDER BY month_name` that sorts wrong. Still open;
+  revisit when trend/date-range queries are actually needed.
+- **[Corrected, was previously mis-assessed]** Retrieval quality was
+  initially thought to just have "weaker matches further down top_k" — lesson
+  12's live testing proved this wrong: for "total revenue in March 2026,"
+  `total_revenue` did not appear even at `top_k=15` — all 15 slots were
+  `billing_amount_<client>` columns. Root cause: 55 near-identical per-client
+  descriptions cluster so tightly that they can completely crowd out a
+  genuinely more relevant distinct metric, no matter how large `top_k` is.
+  **Fixed** by adding `SchemaChunk.is_per_entity` (set at ingestion time) and
+  splitting `retrieve_context()` into two independent pool searches —
+  distinct metrics (`is_per_entity=False`) and per-entity columns
+  (`is_per_entity=True`) — so a distinct metric can never be crowded out by
+  per-client noise. Re-verified: revenue, per-client billing, caller churn,
+  and runway questions all now generate correct SQL.
+- `db.py`'s `SessionLocal` needed `expire_on_commit=False`, added during
+  lesson 12 verification — without it, ORM objects returned from a
+  `db_session()` block (e.g. `RetrievedContext`'s `SchemaChunk`/
+  `FewShotExample` lists, returned by `retrieve_node()`) raised
+  `DetachedInstanceError` the moment their attributes were accessed outside
+  that session (e.g. inside `generate_sql_node()`). Any future node that
+  returns ORM objects across a `db_session()` boundary relies on this
+  setting — worth remembering if a new detached-instance error appears.
+- **[Fixed, lesson 13]** `month_name` in the real data is lowercase
+  (`'march'`, not `'March'`) — the 5 few-shot examples used capitalized
+  month names, and Postgres string comparison is case-sensitive, so every
+  date-filtered query silently returned zero rows rather than erroring
+  (caught when "total revenue in March 2026" returned `[]` despite that
+  exact month/year existing in the data). Fixed in two places: the few-shot
+  examples in `data/companies/futwork.py` (re-ingested), and an explicit
+  instruction added to `generate_sql_node`'s system prompt in `nodes.py`, so
+  the convention holds even for questions with no matching few-shot example.
+- **[Fixed, lesson 13]** `format_answer_node()` (`execute_node.py`)
+  originally only received the question and raw SQL result rows — no
+  business context. Since nothing in the raw numbers says what currency
+  they're in, the LLM defaulted to USD ("$22,063,632") for data that's
+  actually INR. Fixed by passing `retrieved_context.company_profile` into
+  its prompt. Worth remembering for any future formatting/narration step:
+  raw numbers need currency/unit context explicitly stated, never assumed.
 
 ## Companion file
 See `NOTES.md` for the plain-language, no-analogy study notes, the file-creation
@@ -223,11 +290,14 @@ Timeline graph, and the import-dependency Routes Graph.
    to done, mark the new next item, update "Current status", append to "Files
    created so far".
 2. **Update `NOTES.md` — Timeline graph**: append the new file as the next node,
-   connected with `|` / `v` to the previous node. This graph includes ALL files,
-   no exceptions, in strict creation order.
+   connected with `|` / `v` to the previous node, in strict creation order —
+   except empty/near-empty `__init__.py` package markers, which are omitted
+   entirely (no Timeline node, no File notes entry) since there's nothing in
+   them worth studying.
 3. **Update `NOTES.md` — Routes Graph**: only touch this if the new file contains
-   actual import-relevant logic (skip config/text files and empty package-marker
-   files). This is a Mermaid (` ```mermaid graph TD `) diagram, rendered as a
+   actual import-relevant logic (skip config/text files and any `__init__.py`,
+   even one with imports for side effects like table registration — that's
+   plumbing, not something a reader needs to trace). This is a Mermaid (` ```mermaid graph TD `) diagram, rendered as a
    real flowchart by GitHub/VS Code — do not use hand-drawn ASCII arrows, they
    don't scale. There is exactly ONE Routes Graph diagram in NOTES.md — add the
    new node and its edges to that SAME diagram in place; never create a second,
