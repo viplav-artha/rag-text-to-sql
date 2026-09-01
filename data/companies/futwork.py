@@ -187,31 +187,37 @@ METRIC_DESCRIPTIONS = {
 
 # NL question -> correct SQL, used to few-shot the LLM. Kept small deliberately;
 # grows over time as real usage patterns emerge.
+#
+# NOTE: month_name values in the real data are lowercase full month names
+# (e.g. 'march', not 'March') — every example below deliberately uses
+# lowercase to reinforce that convention. Postgres string comparison is
+# case-sensitive, so getting this wrong silently returns zero rows rather
+# than an error.
 FEW_SHOT_EXAMPLES = [
     (
         "What was the total revenue in March 2026?",
         "SELECT total_revenue FROM portfolio.futwork_vs_aop "
-        "WHERE year = 2026 AND month_name = 'March';",
+        "WHERE year = 2026 AND month_name = 'march';",
     ),
     (
         "How does actual EBITDA compare to the AOP target for April 2026?",
         "SELECT ebitda, ebitda_targetted, ebitda - ebitda_targetted AS variance "
-        "FROM portfolio.futwork_vs_aop WHERE year = 2026 AND month_name = 'April';",
+        "FROM portfolio.futwork_vs_aop WHERE year = 2026 AND month_name = 'april';",
     ),
     (
         "What is the split between HITL and AI revenue for May 2026?",
         "SELECT hitl, ai_revenue FROM portfolio.futwork_vs_aop "
-        "WHERE year = 2026 AND month_name = 'May';",
+        "WHERE year = 2026 AND month_name = 'may';",
     ),
     (
         "What was the total billing amount from Amazon in June 2026?",
         "SELECT billing_amount_amazon FROM portfolio.futwork_vs_aop "
-        "WHERE year = 2026 AND month_name = 'June';",
+        "WHERE year = 2026 AND month_name = 'june';",
     ),
     (
         "What is the accounts receivable aging breakdown as of June 2026?",
         "SELECT ar_current, ar_0_to_30_days, ar_30_to_60_days, ar_60_to_90_days, "
         "ar_90_plus_days, ar_total FROM portfolio.futwork_vs_aop "
-        "WHERE year = 2026 AND month_name = 'June';",
+        "WHERE year = 2026 AND month_name = 'june';",
     ),
 ]

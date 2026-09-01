@@ -21,7 +21,7 @@ settings = get_settings()
 
 engine = create_engine(_to_psycopg_url(settings.database_url), pool_pre_ping=True)
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):

@@ -38,13 +38,19 @@ def retrieve_context(
     company: str,
     question: str,
     schema_top_k: int = 5,
+    per_entity_top_k: int = 3,
     example_top_k: int = 3,
 ) -> RetrievedContext:
     profile = get_company_profile(db, company)
-    schema_chunks = search_schema(db, company, question, top_k=schema_top_k)
+    distinct_chunks = search_schema(
+        db, company, question, top_k=schema_top_k, is_per_entity=False
+    )
+    per_entity_chunks = search_schema(
+        db, company, question, top_k=per_entity_top_k, is_per_entity=True
+    )
     examples = search_examples(db, company, question, top_k=example_top_k)
     return RetrievedContext(
         company_profile=profile.profile if profile else None,
-        schema_chunks=schema_chunks,
+        schema_chunks=distinct_chunks + per_entity_chunks,
         examples=examples,
     )
