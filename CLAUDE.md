@@ -65,9 +65,14 @@ error-retries-exhausted → execute, where lesson 13's defense-in-depth guard
 catches it). The full retrieve → generate → validate → execute → format
 pipeline this represents was itself verified end-to-end in lessons 12-13,
 with two real bugs found and fixed there: lowercase `month_name` values, and
-`format_answer_node` originally defaulting to USD instead of INR. Waiting on
-user review/go-ahead before starting lesson 15 (`app/services/query_service.py`),
-which wraps this compiled graph with Redis cache check/write.
+`format_answer_node` originally defaulting to USD instead of INR.
+Additionally, `app/main.py` was built early (out of build order, at the
+user's request) as a minimal FastAPI test harness — one `POST /query`
+endpoint calling `graph.invoke()` directly, verified with a real HTTP
+request. This is not the final lesson-18 file (no caching/schemas/routing
+yet). Waiting on user review/go-ahead before starting lesson 15
+(`app/services/query_service.py`), which wraps the compiled graph with
+Redis cache check/write.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
 
 ## Planned build order
@@ -98,7 +103,12 @@ Subject to adjustment as we go — update in place, don't just append.
 15. **NEXT** — `app/services/query_service.py` — orchestration: Redis cache check → run graph → cache write
 16. `app/api/schemas.py` — FastAPI request/response Pydantic models
 17. `app/api/routes.py` — FastAPI router: `POST /query` endpoint
-18. `app/main.py` — FastAPI app instance, mounts routers, startup/shutdown hooks
+18. `app/main.py` — FastAPI app instance, mounts routers, startup/shutdown hooks.
+    **A minimal early version already exists** (built ahead of schedule as a
+    manual test harness — see "Files created so far" below); this lesson
+    still needs to happen for real, to add Redis caching via
+    `query_service.py`, proper request/response validation via
+    `api/schemas.py`, and router structure via `api/routes.py`.
 
 ## Files created so far (chronological)
 Matches NOTES.md's Timeline numbering exactly — empty/near-empty `__init__.py`
@@ -160,6 +170,13 @@ package markers are omitted from both (see the Maintenance instructions below).
     compiled `StateGraph`, `_route_after_validation()` conditional edge
     (retry generate on validation failure, capped at `_MAX_RETRIES = 2`),
     module-level `graph` ready for `.invoke()`
+20. `app/main.py` — **early/minimal test harness**, built out of build-order
+    ahead of lesson 15-17, at the user's explicit request, to manually test
+    the compiled graph over HTTP. A `FastAPI` app with one `POST /query`
+    endpoint that calls `graph.invoke()` directly — no Redis caching, no
+    `api/schemas.py`/`api/routes.py` layering yet. Verified for real: a
+    live POST request correctly returned "INR 22,063,632" for a real
+    question. Will be substantially rewritten at lesson 18.
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,
@@ -171,7 +188,9 @@ imports the three RAG store modules for table registration —
 ## Environment
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
-- Run (once `app/main.py` exists): `uvicorn app.main:app --reload`
+- Run: `uvicorn app.main:app --reload` — currently the early/minimal test
+  harness (see "Files created so far"), one `POST /query` endpoint
+  (`{"company": "futwork", "question": "..."}`), no caching yet
 - External services required, credentials supplied via `.env`:
   - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —
     `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`, `AWS_PROFILE`,
