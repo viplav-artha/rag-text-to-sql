@@ -325,6 +325,12 @@ chat and in CLAUDE.md, not here).
   new columns, then re-verified: inserted a real `hitl` chunk for company
   `futwork`, confirmed `search_schema()` for a *different* company correctly
   returns `[]`, then removed the verification row.
+  **Corrected post-hoc again**, at explicit user request: `SchemaChunk`
+  gained `__table_args__ = {"schema": "rag"}` so the table lives at
+  `rag.schema_chunks` instead of `public.schema_chunks` — grouping all
+  three RAG bookkeeping tables under one dedicated schema, separate from
+  Postgres's default `public`. Same drop/recreate/re-ingest cycle as
+  before; re-verified retrieval and the live `/query` endpoint afterward.
 
 ### [11] app/rag/example_store.py (Routes Graph node 7)
 - Motive: Give few-shot NL→SQL examples (question paired with the correct
@@ -346,6 +352,9 @@ chat and in CLAUDE.md, not here).
   created, profit-margin example correctly ranked first, test rows
   removed). **Corrected post-hoc** alongside `schema_store.py` for the same
   multi-tenancy reason — table dropped and recreated with the new column.
+  **Corrected post-hoc again**, at explicit user request: also gained
+  `__table_args__ = {"schema": "rag"}`, moving it to `rag.few_shot_examples`
+  — see `schema_store.py`'s note above for the full rationale.
 
 ### [12] app/rag/retriever.py (Routes Graph node 8)
 - Motive: The SQL-generation node (built next in the `app/graph/` lessons)
@@ -407,6 +416,11 @@ chat and in CLAUDE.md, not here).
   business profile was stored for real (not test data — kept, unlike the
   schema/example verification rows), and a lookup for a nonexistent company
   correctly returned `None`.
+  **Corrected post-hoc**, at explicit user request: also gained
+  `__table_args__ = {"schema": "rag"}`, moving it to `rag.company_profiles`
+  — see `schema_store.py`'s note (Timeline `[10]`) for the full rationale.
+  The Futwork profile was re-upserted for real via re-running
+  `ingest_knowledge.py` after the move.
 
 ### [14] data/companies/futwork.py (Routes Graph node 10)
 - Motive: Separates *data* (what the 67 metrics mean, the per-client

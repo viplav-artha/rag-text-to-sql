@@ -8,6 +8,7 @@ from app.rag.embeddings import get_embeddings
 
 class SchemaChunk(Base):
     __tablename__ = "schema_chunks"
+    __table_args__ = {"schema": "rag"}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company: Mapped[str] = mapped_column(String(64))

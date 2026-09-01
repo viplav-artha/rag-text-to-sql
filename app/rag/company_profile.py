@@ -6,6 +6,7 @@ from app.core.db import Base
 
 class CompanyProfile(Base):
     __tablename__ = "company_profiles"
+    __table_args__ = {"schema": "rag"}
 
     company: Mapped[str] = mapped_column(String(64), primary_key=True)
     profile: Mapped[str] = mapped_column(Text)
