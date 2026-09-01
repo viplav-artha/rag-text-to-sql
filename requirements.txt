@@ -7,3 +7,4 @@ pgvector
 redis
 langchain-huggingface
 sentence-transformers
+langgraph
