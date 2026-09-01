@@ -65,7 +65,12 @@ study and are omitted here). Each node is numbered by creation order.
 [18] app/graph/execute_node.py
      |
      v
-[19] app/graph/graph.py  <-- NEXT (update this marker as files are added)
+[19] app/graph/graph.py
+     |
+     v
+[20] app/main.py  <-- NEXT (update this marker as files are added; note: this
+     is an early/minimal test harness built ahead of build order — see its
+     file note for why it's out of sequence)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -144,6 +149,8 @@ graph TD
     n12 -->|GraphState| n15
     n13 -->|generate_sql_node, retrieve_node, validate_sql_node| n15
     n14 -->|execute_sql_node, format_answer_node| n15
+    n16["[20] app/main.py"]
+    n15 -->|graph| n16
 ```
 
 ## File notes
@@ -593,3 +600,23 @@ chat and in CLAUDE.md, not here).
   error with retries remaining → generate; error with retries exhausted →
   execute (where `execute_sql_node`'s defense-in-depth guard from lesson 13
   catches it and reports failure cleanly instead of running bad SQL).
+
+### [20] app/main.py (Routes Graph node 16)
+- Motive: Built out of build-order sequence, at explicit user request, to
+  manually test the compiled graph over real HTTP before the proper
+  caching/schema/routing layers (lessons 15-17) exist. Not the final
+  lesson-18 file — flagged as such in `CLAUDE.md` so a future session
+  doesn't mistake this for finished work.
+- Logic: A `FastAPI` app with `QueryRequest` (`company`, `question`) and
+  `QueryResponse` (`generated_sql`, `sql_result`, `final_answer`,
+  `validation_error`, `execution_error`) as inline Pydantic models — these
+  will move into `api/schemas.py` at lesson 16. One `POST /query` endpoint
+  calls `graph.invoke({"company": ..., "question": ...})` directly (no
+  Redis cache check, since `query_service.py` doesn't exist yet) and maps
+  the result dict onto `QueryResponse`. Imports `graph` from
+  `app/graph/graph.py` (Timeline `[19]`, Routes Graph node 15).
+  **Verified for real**: started with `uvicorn app.main:app`, a live
+  `curl POST /query` for "What was the total revenue in March 2026?"
+  correctly returned `sql_result: [{"total_revenue": 22063632}]` and
+  `final_answer: "The total revenue for Futwork in March 2026 was INR
+  22,063,632."` over actual HTTP.

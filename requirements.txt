@@ -8,3 +8,5 @@ redis
 langchain-huggingface
 sentence-transformers
 langgraph
+fastapi
+uvicorn[standard]
