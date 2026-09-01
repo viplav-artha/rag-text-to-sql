@@ -13,13 +13,17 @@ _PER_CLIENT_PATTERN = re.compile(
 )
 
 
-def _describe_column(column_name: str) -> str | None:
+def _describe_column(column_name: str) -> tuple[str, bool] | None:
     match = _PER_CLIENT_PATTERN.match(column_name)
     if match:
         base_metric, client = match.groups()
         template = company_data.PER_CLIENT_TEMPLATES[base_metric]
-        return template.format(client=client)
-    return company_data.METRIC_DESCRIPTIONS.get(column_name)
+        return template.format(client=client), True
+
+    description = company_data.METRIC_DESCRIPTIONS.get(column_name)
+    if description is None:
+        return None
+    return description, False
 
 
 def ingest() -> None:
@@ -40,10 +44,11 @@ def ingest() -> None:
             if name in company_data.EXCLUDED_COLUMNS:
                 continue
 
-            description = _describe_column(name)
-            if description is None:
+            result = _describe_column(name)
+            if result is None:
                 skipped.append(name)
                 continue
+            description, is_per_entity = result
 
             add_schema_chunk(
                 db,
@@ -52,6 +57,7 @@ def ingest() -> None:
                 company_data.TABLE_NAME,
                 description,
                 column_name=name,
+                is_per_entity=is_per_entity,
             )
             inserted += 1
 
