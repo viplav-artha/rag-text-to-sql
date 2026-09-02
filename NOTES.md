@@ -68,9 +68,22 @@ study and are omitted here). Each node is numbered by creation order.
 [19] app/graph/graph.py
      |
      v
-[20] app/main.py  <-- NEXT (update this marker as files are added; note: this
-     is an early/minimal test harness built ahead of build order — see its
-     file note for why it's out of sequence)
+[20] app/main.py (early/minimal test harness, built ahead of build order)
+     |
+     v
+[21] evals/__init__.py
+     |
+     v
+[22] evals/create_financial_qa_dataset.py
+     |
+     v
+[23] evals/create_sql_safety_dataset.py
+     |
+     v
+[24] evals/run_financial_qa_eval.py
+     |
+     v
+[25] evals/run_sql_safety_eval.py  <-- NEXT (update this marker as files are added)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -151,6 +164,12 @@ graph TD
     n14 -->|execute_sql_node, format_answer_node| n15
     n16["[20] app/main.py"]
     n15 -->|graph| n16
+    n17["[24] evals/run_financial_qa_eval.py"]
+    n3 -->|db_session| n17
+    n14 -->|_serialize_value| n17
+    n15 -->|graph| n17
+    n18["[25] evals/run_sql_safety_eval.py"]
+    n13 -->|validate_sql_node| n18
 ```
 
 ## File notes
@@ -396,6 +415,12 @@ chat and in CLAUDE.md, not here).
   the two-pool split: `total_revenue` now appears in the distinct-metrics
   pool, and per-client questions (e.g. "billing amount from BharatPe") still
   correctly surface the right per-entity column from its own pool.
+  **Corrected again, eval-driven**: `schema_top_k` default raised from 5 to
+  8 after `evals/run_financial_qa_eval.py` (Timeline `[24]`) showed a
+  6-column AR-aging question could only ever retrieve 5 of the 6 needed
+  columns under the old default — a capacity limit, not a ranking quality
+  issue. Re-run confirmed both `execution_accuracy` and `retrieval_recall`
+  hit 1.0 for that question after the fix.
 
 ### [13] app/rag/company_profile.py (Routes Graph node 9)
 - Motive: Schema/example knowledge alone doesn't tell the LLM *how a
@@ -634,3 +659,117 @@ chat and in CLAUDE.md, not here).
   correctly returned `sql_result: [{"total_revenue": 22063632}]` and
   `final_answer: "The total revenue for Futwork in March 2026 was INR
   22,063,632."` over actual HTTP.
+
+### [21] evals/__init__.py
+- Motive: Marks `evals/` as a Python package for eval-related scripts
+  (dataset setup now; eval-running/scoring logic later).
+- Logic: Empty file.
+
+### [22] evals/create_financial_qa_dataset.py
+- Motive: Powers three planned evals (execution accuracy, retrieval recall,
+  answer groundedness) that all need the same reference data — a question
+  paired with its correct SQL — kept as a separate LangSmith dataset from
+  `data/companies/futwork.py`'s few-shot examples so the eval never
+  trivially matches an identical question.
+- Logic: No internal project imports — only `dotenv` and `langsmith`, so
+  this file has no Routes Graph edges (nothing to show; it neither imports
+  nor is imported by any other project file). `EXAMPLES` is a list of 7
+  `{question, expected_sql, expected_columns}` dicts, covering the distinct-
+  metric pool, per-entity columns, and a multi-column query, all against
+  real months confirmed to exist in the data (March-June 2026).
+  `sync_dataset()` gets-or-creates the `financial-qa-eval-futwork` LangSmith
+  dataset, then diffs `EXAMPLES` against the dataset's *actual current
+  content* — matched by each example's `question` text — to compute
+  `to_create`/`to_update`/`to_delete`, and applies exactly that diff via
+  `create_examples()`/`update_examples()`/`delete_examples(...,
+  hard_delete=True)`.
+  **Important discovery, found via live testing**: an earlier version of
+  this script generated a deterministic UUID per example (hashing the
+  question text) so it could pass an explicit `id` to `create_examples()`
+  and treat that as an upsert key. This does not work — LangSmith
+  permanently reserves an example ID once assigned, even after a hard
+  delete, so recreating an example with that same ID throws `409 Conflict`.
+  Also, `delete_examples()` defaults to a *soft* delete (`hard_delete=False`)
+  that hides the example from `list_examples()` without freeing its ID.
+  Rewritten to match by actual content instead of a synthetic ID, and to
+  always pass `hard_delete=True`.
+  **Verified for real** against the live LangSmith API: initial creation
+  (7 created), a true no-op re-run (0/0/0), a genuine content change
+  correctly detected as 1 update (and reverting it detected as another
+  update), and the delete → recreate-with-identical-content cycle — the
+  exact case that broke the UUID-based design — now succeeds cleanly.
+
+### [23] evals/create_sql_safety_dataset.py
+- Motive: Powers the SQL-safety eval — confirms `validate_sql_node`
+  reliably rejects adversarial SQL. Kept as a separate dataset from the
+  financial-QA one since its examples and success criteria are a
+  fundamentally different kind of thing ("was this correctly rejected?"
+  vs. "is this answer correct?").
+- Logic: Same shape and same content-based matching as
+  `create_financial_qa_dataset.py` (matched by `candidate_sql` text
+  instead of `question`), and the same "no internal project imports, no
+  Routes Graph edges" note applies. `EXAMPLES` is a list of 10 adversarial
+  `candidate_sql` strings covering every forbidden keyword
+  `validate_sql_node` checks for (`DROP`/`DELETE`/`UPDATE`/`INSERT`/
+  `ALTER`/`TRUNCATE`/`GRANT`), two wrong-table references
+  (`pg_catalog.pg_tables`, `information_schema.tables`), and one
+  statement-chaining injection attempt. Each example's `outputs` is just
+  `{"should_be_rejected": True}` — consumed by `run_sql_safety_eval.py`
+  (below), which feeds `candidate_sql` into `validate_sql_node` and checks
+  `validation_error` came back non-`None`.
+  **Verified for real**: same create → no-op re-run → update/delete/
+  recreate cycle as the financial-QA script, all passing cleanly.
+
+### [24] evals/run_financial_qa_eval.py (Routes Graph node 17)
+- Motive: The datasets alone don't test anything — this is the actual
+  experiment: run the full pipeline against every question in
+  `financial-qa-eval-futwork` and score it three different ways.
+- Logic: `run_pipeline(inputs)` is the LangSmith "target function" —
+  calls `graph.invoke()` and returns `generated_sql`, `retrieved_columns`
+  (extracted from `retrieved_context.schema_chunks`), `sql_result`, and
+  `final_answer`. Three evaluator functions, each declaring only the
+  parameter names it needs (`outputs`, `reference_outputs` — LangSmith
+  introspects the function signature and supplies matching values):
+  `execution_accuracy` runs `expected_sql` for real via
+  `_run_reference_sql()`, projects both the actual and expected rows down
+  to just `expected_columns` via `_project_rows()` (so a harmless extra
+  computed column doesn't get penalized), and compares the normalized row
+  sets. `retrieval_recall` checks what fraction of `expected_columns`
+  appear in `retrieved_columns`. `answer_groundedness` extracts every
+  number from `final_answer` (`_extract_numbers()`, a regex over
+  digit/comma/decimal sequences) and checks whether any of them is within
+  tolerance (`math.isclose(rel_tol=1e-3, abs_tol=0.05)`) of any number in
+  the reference SQL's real result — tolerant of normal rounding, not an
+  exact string match — plus a `$`/`USD` check for wrong currency. Imports
+  `db_session` from `app/core/db.py` (Timeline `[7]`, Routes Graph node 3),
+  `_serialize_value` from `app/graph/execute_node.py` (Timeline `[18]`,
+  Routes Graph node 14), and `graph` from `app/graph/graph.py` (Timeline
+  `[19]`, Routes Graph node 15).
+  **Verified for real, twice.** First run surfaced genuine findings:
+  `execution_accuracy` 0.71, `retrieval_recall` 0.83, `answer_groundedness`
+  0.71 across 7 examples. Diagnosis: one real pipeline bug (a 6-column
+  AR-aging question could only retrieve 5, since `retriever.py`'s
+  `schema_top_k` defaulted to 5 — fixed by raising it to 8, see that
+  file's note) and two false negatives in this script itself (fixed as
+  described above). Re-run after both fixes: `execution_accuracy` 1.0,
+  `retrieval_recall` 0.93, `answer_groundedness` 1.0 — every example now
+  correct on execution and groundedness; one column (`ebitda`) still
+  doesn't rank in retrieval for one question, a genuine embedding-
+  similarity quirk (its description shares no vocabulary with "AOP
+  target") that didn't cause a wrong answer and is logged as a monitored,
+  non-urgent gap in `CLAUDE.md`.
+
+### [25] evals/run_sql_safety_eval.py (Routes Graph node 18)
+- Motive: Confirms the safety net actually works — feeds every adversarial
+  SQL string in `sql-safety-eval-futwork` directly into the real validator,
+  not a re-implementation of its logic.
+- Logic: `run_validation(inputs)` builds a minimal fake `GraphState` (just
+  enough fields for `validate_sql_node` to run: `company`, `generated_sql`
+  set to the candidate SQL, `retry_count` 0) and calls `validate_sql_node`
+  directly — no LLM, no DB, so this runs fast and free. `safety_rejection`
+  checks whether `validation_error` came back non-`None`, matching the
+  reference `should_be_rejected` flag. Imports `validate_sql_node` from
+  `app/graph/nodes.py` (Timeline `[17]`, Routes Graph node 13).
+  **Verified for real**: 10/10 adversarial examples correctly rejected on
+  the first run — every forbidden keyword, both wrong-table references,
+  and the statement-chaining injection attempt.
