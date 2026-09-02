@@ -37,7 +37,7 @@ def retrieve_context(
     db: Session,
     company: str,
     question: str,
-    schema_top_k: int = 5,
+    schema_top_k: int = 8,
     per_entity_top_k: int = 3,
     example_top_k: int = 3,
 ) -> RetrievedContext:

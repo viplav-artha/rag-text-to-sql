@@ -10,3 +10,4 @@ sentence-transformers
 langgraph
 fastapi
 uvicorn[standard]
+langsmith
