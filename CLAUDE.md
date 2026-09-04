@@ -54,58 +54,31 @@ tests are expected, not just a working demo.
   command first.
 
 ## Current status
-Stage: Lesson 14 (`app/graph/graph.py`) done — `langgraph` installed and
-wired for real. All 5 nodes (retrieve, generate, validate, execute, format)
-are now assembled into a compiled `StateGraph` with a conditional
-validate→(generate|execute) retry edge, capped at `_MAX_RETRIES = 2`.
-Verified two ways: `graph.invoke({...})` end-to-end on a real question
-(correctly answered "INR 22,063,632" via the single `.invoke()` call, no
-manual node chaining needed), and the routing function's boundary conditions
-tested directly (no-error → execute, error-with-retries-left → generate,
-error-retries-exhausted → execute, where lesson 13's defense-in-depth guard
-catches it). The full retrieve → generate → validate → execute → format
-pipeline this represents was itself verified end-to-end in lessons 12-13,
-with two real bugs found and fixed there: lowercase `month_name` values, and
-`format_answer_node` originally defaulting to USD instead of INR.
-Additionally, `app/main.py` was built early (out of build order, at the
-user's request) as a minimal FastAPI test harness — one `POST /query`
-endpoint calling `graph.invoke()` directly, verified with a real HTTP
-request. This is not the final lesson-18 file (no caching/schemas/routing
-yet). All three RAG bookkeeping tables (`company_profiles`,
-`few_shot_examples`, `schema_chunks`) were then moved from `public` into a
-dedicated `rag` schema (still the same Neon RAG-branch database) at the
-user's request, via `__table_args__ = {"schema": "rag"}` on all three ORM
-models — re-verified end-to-end (retrieval + the live `/query` endpoint)
-after the move. LangSmith eval infrastructure was then set up (out of build
-order, at the user's request): `evals/create_financial_qa_dataset.py` and
-`evals/create_sql_safety_dataset.py`, each an idempotent, re-runnable script
-that syncs one LangSmith dataset (create new examples, update changed ones,
-delete removed ones) by diffing against the real dataset content — matched
-by the example's actual text (`question`/`candidate_sql`), not a synthetic
-ID, since LangSmith never allows reusing an example ID once assigned, even
-after a hard delete (discovered via live testing; the fix is documented in
-each script's docstring). Both verified for real: full create → no-op
-re-run → update-detected → delete-detected → recreate-after-delete cycle,
-all against the live LangSmith API. The eval-running/scoring logic was then
-built and run for real: `evals/run_financial_qa_eval.py` (invokes the full
-graph, scores execution accuracy, retrieval recall, and answer groundedness)
-and `evals/run_sql_safety_eval.py` (calls `validate_sql_node` directly,
-scores whether adversarial SQL was correctly rejected — 10/10 on first run).
-The first financial-QA run surfaced real findings: execution_accuracy 0.71,
-retrieval_recall 0.83, answer_groundedness 0.71 — one genuine pipeline bug
-(a 6-column AR-aging query only retrieved 5 columns, since `schema_top_k`
-defaulted to 5, one short of what the question needed) and two evaluator
-false negatives (`execution_accuracy` penalized a generated SQL for adding a
-harmless extra computed column; `answer_groundedness` demanded an exact
-full-precision float string instead of tolerating normal rounding). All
-three fixed — `schema_top_k` raised from 5 to 8, `execution_accuracy`
-projects both sides down to just the expected columns before comparing,
-`answer_groundedness` uses `math.isclose()` tolerance instead of exact
-string matching. Re-run confirmed the fix: execution_accuracy 1.0,
-retrieval_recall 0.93, answer_groundedness 1.0 (7/7 examples). One minor,
-non-urgent gap remains — see Known gaps. Waiting on user review/go-ahead
-before starting lesson 15 (`app/services/query_service.py`), which wraps
-the compiled graph with Redis cache check/write.
+**Stage: Lesson 18 (`app/main.py` final rewrite) done and verified for
+real — this was the last lesson in the planned build order. The build is
+complete.**
+
+`app/main.py` now has a real `lifespan` context manager (the modern
+FastAPI startup-hook pattern, not the soft-deprecated `@app.on_event`
+style) that runs `init_pgvector_extension()` and `Base.metadata.
+create_all(engine)` once at app boot — an explicit `import app.rag` right
+before it guarantees all three RAG models are registered first. Verified
+for real: server restarted cleanly, row counts in `rag.schema_chunks`/
+`rag.few_shot_examples`/`rag.company_profiles` were unchanged after
+restart (177/5/1 — confirming `create_all()` never touches existing
+tables), and the `/query` endpoint still returned a correct, real answer.
+
+Every planned lesson (1 through 18) is now done, plus everything built
+outside the numbered sequence at explicit user request along the way: the
+`rag`-schema move for the RAG bookkeeping tables, and the LangSmith eval
+infrastructure (2 datasets + 2 experiment runners, which already found and
+fixed one real pipeline bug — see Known gaps). See "Files created so far"
+below and `NOTES.md` for the full file-by-file history.
+
+No further lessons are currently planned — future work would be genuinely
+new scope (e.g. a second company, hardening one of the logged Known gaps,
+or something the user decides next), not a continuation of this build
+order.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
 
 ## Planned build order
@@ -133,15 +106,17 @@ Subject to adjustment as we go — update in place, don't just append.
 12. **DONE** — `app/graph/nodes.py` — LangGraph nodes: retrieve context, generate SQL, validate SQL
 13. **DONE** — `app/graph/execute_node.py` — LangGraph node: execute validated SQL, format result
 14. **DONE** — `app/graph/graph.py` — assembles the StateGraph, wires nodes + conditional routing
-15. **NEXT** — `app/services/query_service.py` — orchestration: Redis cache check → run graph → cache write
-16. `app/api/schemas.py` — FastAPI request/response Pydantic models
-17. `app/api/routes.py` — FastAPI router: `POST /query` endpoint
-18. `app/main.py` — FastAPI app instance, mounts routers, startup/shutdown hooks.
-    **A minimal early version already exists** (built ahead of schedule as a
-    manual test harness — see "Files created so far" below); this lesson
-    still needs to happen for real, to add Redis caching via
-    `query_service.py`, proper request/response validation via
-    `api/schemas.py`, and router structure via `api/routes.py`.
+15. **DONE** — `app/services/query_service.py` — orchestration: Redis cache check → run graph → cache write
+16. **DONE** — `app/api/schemas.py` — FastAPI request/response Pydantic models
+17. **DONE** — `app/api/routes.py` — FastAPI router: `POST /query` endpoint
+18. **DONE** — `app/main.py` — FastAPI app instance, mounts router, `lifespan`
+    startup hook (`init_pgvector_extension()` + `Base.metadata.create_all()`).
+    Started as an early minimal test harness at lesson 12 and was
+    incrementally completed in place across lessons 15-18 (caching, schema
+    validation, router structure, startup hooks) rather than rewritten from
+    scratch — **this is now the real, finished file**.
+
+**Build order complete — all 18 planned lessons done.**
 
 ## Files created so far (chronological)
 Matches NOTES.md's Timeline numbering exactly — empty/near-empty `__init__.py`
@@ -207,13 +182,19 @@ package markers are omitted from both (see the Maintenance instructions below).
     compiled `StateGraph`, `_route_after_validation()` conditional edge
     (retry generate on validation failure, capped at `_MAX_RETRIES = 2`),
     module-level `graph` ready for `.invoke()`
-20. `app/main.py` — **early/minimal test harness**, built out of build-order
-    ahead of lesson 15-17, at the user's explicit request, to manually test
-    the compiled graph over HTTP. A `FastAPI` app with one `POST /query`
-    endpoint that calls `graph.invoke()` directly — no Redis caching, no
-    `api/schemas.py`/`api/routes.py` layering yet. Verified for real: a
-    live POST request correctly returned "INR 22,063,632" for a real
-    question. Will be substantially rewritten at lesson 18.
+20. `app/main.py` — started at lesson 12 as an early minimal test harness
+    (built ahead of build order, at the user's explicit request, calling
+    `graph.invoke()` directly), then incrementally completed in place
+    rather than rewritten from scratch: **lesson 15** switched it to
+    `run_query()` for caching; **lesson 16** moved its inline
+    `QueryRequest`/`QueryResponse` out to `api/schemas.py`; **lesson 17**
+    replaced its own `@app.post` endpoint with `app.include_router(router)`;
+    **lesson 18** added the `lifespan` startup hook
+    (`init_pgvector_extension()` + `Base.metadata.create_all()`, guarded by
+    an explicit `import app.rag` for model registration). **This is now
+    the real, finished file** — verified for real: clean restart, row
+    counts in all three RAG tables unchanged after restart (confirming
+    `create_all()` never touches existing data), `/query` still correct.
 21. `evals/__init__.py` — empty package marker for the `evals` package
 22. `evals/create_financial_qa_dataset.py` — idempotent script that syncs the
     `financial-qa-eval-futwork` LangSmith dataset (7 question/expected_sql/
@@ -236,6 +217,27 @@ package markers are omitted from both (see the Maintenance instructions below).
     against every example in `sql-safety-eval-futwork`; one evaluator,
     `safety_rejection`, checks `validation_error` came back non-`None` —
     run for real: 10/10
+26. `app/services/__init__.py` — empty package marker for the `app.services` package
+27. `app/services/query_service.py` — `run_query(company, question)`:
+    Redis cache check via `make_cache_key()`/`cache_get()`, `graph.invoke()`
+    on a miss, narrows the state to 5 JSON-safe fields, only caches genuine
+    successes (`validation_error`/`execution_error` both `None`). Verified
+    live over HTTP via `app/main.py` (now calling `run_query()` instead of
+    `graph.invoke()` directly): first request 22.6s, identical second
+    request 0.065s (cache hit).
+28. `app/api/__init__.py` — empty package marker for the `app.api` package
+29. `app/api/schemas.py` — `QueryRequest` (`company`/`question`, required,
+    whitespace-stripped, rejected if blank, `question` capped at 500 chars
+    via a `field_validator`) and `QueryResponse` (same 5 fields as before) —
+    replaces the inline models that used to live in `app/main.py`. Verified
+    live over HTTP: a blank question returns a clean `422`, a valid one
+    still returns `200` with the correct answer.
+30. `app/api/routes.py` — `APIRouter` with the `POST /query` endpoint;
+    wraps `run_query()` in `try`/`except KeyError` to turn an unknown
+    company into a clean `404` instead of an unhandled `500`. `app/main.py`
+    now mounts this router via `include_router()` instead of defining the
+    endpoint itself. All three paths (unknown company, blank question,
+    valid question) re-verified live over HTTP.
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,
@@ -247,9 +249,12 @@ imports the three RAG store modules for table registration —
 ## Environment
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
-- Run: `uvicorn app.main:app --reload` — currently the early/minimal test
-  harness (see "Files created so far"), one `POST /query` endpoint
-  (`{"company": "futwork", "question": "..."}`), no caching yet
+- Run: `uvicorn app.main:app --reload` — the real, finished app as of
+  lesson 18: one `POST /query` endpoint
+  (`{"company": "futwork", "question": "..."}`), Redis-cached via
+  `query_service.py`, validated via `api/schemas.py`, routed via
+  `api/routes.py`, with a `lifespan` startup hook that bootstraps the
+  pgvector extension and RAG tables automatically
 - External services required, credentials supplied via `.env`:
   - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —
     `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`, `AWS_PROFILE`,
@@ -392,6 +397,19 @@ imports the three RAG store modules for table registration —
   answer in practice (the near-identical few-shot example carried the LLM
   through), so left as a monitored gap rather than chased further — revisit
   if it ever causes an actual wrong-SQL generation.
+- **[Fixed, lesson 17]** `app/api/schemas.py`'s `QueryRequest` validates
+  shape only (non-empty, length-capped), not whether `company` is one the
+  pipeline actually knows about — an unrecognized company reaches
+  `nodes.py`'s `_get_company_data()`, which raises a plain `KeyError`.
+  `app/api/routes.py` now catches that specific exception and returns a
+  clean `404 Unknown company: '...'` instead of an unhandled `500`.
+  **Still an open, smaller gap**: catching bare `KeyError` is a little
+  broad — some unrelated bug could theoretically also raise a `KeyError`
+  in this call path and get misreported as "unknown company." A more
+  precise fix would expose a dedicated `is_known_company()` check from
+  `nodes.py`'s `_COMPANY_DATA` registry and validate *before* calling the
+  graph at all. Not urgent since there's currently no other source of
+  `KeyError` in this path, but worth doing if/when that stops being true.
 
 ## Companion file
 See `NOTES.md` for the plain-language, no-analogy study notes, the file-creation

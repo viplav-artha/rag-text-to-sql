@@ -83,7 +83,18 @@ study and are omitted here). Each node is numbered by creation order.
 [24] evals/run_financial_qa_eval.py
      |
      v
-[25] evals/run_sql_safety_eval.py  <-- NEXT (update this marker as files are added)
+[25] evals/run_sql_safety_eval.py
+     |
+     v
+[26] app/services/query_service.py
+     |
+     v
+[27] app/api/schemas.py
+     |
+     v
+[28] app/api/routes.py  <-- BUILD COMPLETE (all 18 planned lessons done;
+     lesson 18 only edited [20] app/main.py further, no new file — see its
+     updated note below)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -163,13 +174,21 @@ graph TD
     n13 -->|generate_sql_node, retrieve_node, validate_sql_node| n15
     n14 -->|execute_sql_node, format_answer_node| n15
     n16["[20] app/main.py"]
-    n15 -->|graph| n16
+    n3 -->|Base, engine, init_pgvector_extension| n16
     n17["[24] evals/run_financial_qa_eval.py"]
     n3 -->|db_session| n17
     n14 -->|_serialize_value| n17
     n15 -->|graph| n17
     n18["[25] evals/run_sql_safety_eval.py"]
     n13 -->|validate_sql_node| n18
+    n19["[26] app/services/query_service.py"]
+    n4 -->|cache_get, cache_set, make_cache_key| n19
+    n15 -->|graph| n19
+    n20["[27] app/api/schemas.py"]
+    n21["[28] app/api/routes.py"]
+    n20 -->|QueryRequest, QueryResponse| n21
+    n19 -->|run_query| n21
+    n21 -->|router| n16
 ```
 
 ## File notes
@@ -641,24 +660,109 @@ chat and in CLAUDE.md, not here).
   catches it and reports failure cleanly instead of running bad SQL).
 
 ### [20] app/main.py (Routes Graph node 16)
-- Motive: Built out of build-order sequence, at explicit user request, to
-  manually test the compiled graph over real HTTP before the proper
-  caching/schema/routing layers (lessons 15-17) exist. Not the final
-  lesson-18 file — flagged as such in `CLAUDE.md` so a future session
-  doesn't mistake this for finished work.
-- Logic: A `FastAPI` app with `QueryRequest` (`company`, `question`) and
-  `QueryResponse` (`generated_sql`, `sql_result`, `final_answer`,
-  `validation_error`, `execution_error`) as inline Pydantic models — these
-  will move into `api/schemas.py` at lesson 16. One `POST /query` endpoint
-  calls `graph.invoke({"company": ..., "question": ...})` directly (no
-  Redis cache check, since `query_service.py` doesn't exist yet) and maps
-  the result dict onto `QueryResponse`. Imports `graph` from
-  `app/graph/graph.py` (Timeline `[19]`, Routes Graph node 15).
+- Motive: Built out of build-order sequence at lesson 12, at explicit user
+  request, to manually test the compiled graph over real HTTP before the
+  proper caching/schema/routing/startup layers existed — then completed in
+  place across lessons 15-18 rather than rewritten from scratch. **As of
+  lesson 18, this is the real, finished file.**
+- Logic: A `FastAPI` app with one `POST /query` endpoint that maps the
+  result dict onto `QueryResponse`.
   **Verified for real**: started with `uvicorn app.main:app`, a live
   `curl POST /query` for "What was the total revenue in March 2026?"
   correctly returned `sql_result: [{"total_revenue": 22063632}]` and
   `final_answer: "The total revenue for Futwork in March 2026 was INR
   22,063,632."` over actual HTTP.
+  **Corrected post-hoc in lesson 15**: originally called
+  `graph.invoke({"company": ..., "question": ...})` directly (no caching,
+  since `query_service.py` didn't exist yet). Now calls `run_query()`
+  instead, so the test harness actually exercises Redis caching. Imports
+  `run_query` from `app/services/query_service.py` (Timeline `[26]`, Routes
+  Graph node 19) — the direct import of `graph` from `app/graph/graph.py`
+  was removed.
+  **Corrected post-hoc in lesson 16**: `QueryRequest`/`QueryResponse` were
+  originally defined inline in this file — moved to `app/api/schemas.py`
+  (below) and imported from there instead, so the API's actual validation
+  rules live in one dedicated place. Re-verified live: a blank question
+  now returns a clean `422`, a valid one still returns `200`.
+  **Corrected post-hoc in lesson 17**: the `@app.post("/query")` endpoint
+  itself moved out to `app/api/routes.py` — this file now just
+  instantiates `FastAPI` and calls `app.include_router(router)`. The
+  direct imports of `run_query`/`QueryRequest`/`QueryResponse` were
+  removed; the only remaining import is `router` from `app/api/routes.py`
+  (Timeline `[28]`, Routes Graph node 21).
+  **Completed in lesson 18 (the last planned lesson)**: added a `lifespan`
+  async context manager — the modern FastAPI startup-hook pattern, not the
+  soft-deprecated `@app.on_event("startup")` style — that runs
+  `init_pgvector_extension()` and `Base.metadata.create_all(engine)` once
+  at app boot, passed to `FastAPI(lifespan=lifespan)`. An explicit
+  `import app.rag` right before it guarantees `SchemaChunk`/
+  `FewShotExample`/`CompanyProfile` are registered on `Base.metadata`
+  before `create_all()` runs, without depending on some other import chain
+  happening to touch those modules first. Imports `Base`, `engine`,
+  `init_pgvector_extension` from `app/core/db.py` (Timeline `[7]`, Routes
+  Graph node 3).
+  **Verified for real**: server restarted cleanly ("Application startup
+  complete"), row counts in `rag.schema_chunks`/`rag.few_shot_examples`/
+  `rag.company_profiles` were unchanged after restart (177/5/1 —
+  `create_all()` only creates tables that don't exist, never touches ones
+  that do), and `/query` still returned a correct real answer afterward.
+
+### [27] app/api/schemas.py (Routes Graph node 20)
+- Motive: The request/response contract for the API deserves its own file
+  with real validation — not inline models in `main.py` that only checked
+  "is this a string."
+- Logic: `QueryRequest` has `company` (`Field(..., min_length=1,
+  max_length=64)`) and `question` (`Field(..., min_length=1,
+  max_length=500)`). A `field_validator` applied to both fields at once
+  strips whitespace and raises if the result is blank — closes a gap
+  `min_length` alone leaves open, since Pydantic's `min_length` counts the
+  *unstripped* string, so `"   "` would otherwise pass a bare
+  `min_length=1` check. `QueryResponse` is unchanged from what used to live
+  in `main.py` — the same 5 fields (`generated_sql`, `sql_result`,
+  `final_answer`, `validation_error`, `execution_error`). Deliberately does
+  **not** validate that `company` is a company the pipeline actually knows
+  about (currently just `"futwork"`) — that's business logic for the route
+  handler (lesson 17), not a shape concern; confirmed this gap is real by
+  sending an unknown company and getting a raw unhandled `500`, logged in
+  `CLAUDE.md`'s Known gaps (now fixed — see `app/api/routes.py`'s note
+  below). Imported by `app/api/routes.py` (Timeline `[28]`, Routes Graph
+  node 21) — no longer imported directly by `app/main.py`.
+
+### [28] app/api/routes.py (Routes Graph node 21)
+- Motive: Separates "what the `/query` endpoint does" from "how the
+  FastAPI app is wired together" — and is the natural place to fix the
+  unknown-company gap, since that's a business-logic concern for a route
+  handler, not something `schemas.py`'s shape validation should own.
+- Logic: `router = APIRouter()` — a group of routes that doesn't need a
+  `FastAPI` app instance to exist yet; gets attached later via
+  `include_router()`. The `POST /query` handler wraps `run_query()` in
+  `try`/`except KeyError`, raising `HTTPException(status_code=404,
+  detail=f"Unknown company: {request.company!r}")` on failure — the
+  `KeyError` actually originates one level down, inside
+  `generate_sql_node`'s `_get_company_data()` dict lookup (`retrieve_node`
+  doesn't fail for an unknown company; `get_company_profile()`/
+  `search_schema()`/`search_examples()` all degrade gracefully to empty
+  results instead of raising). Imports `QueryRequest`/`QueryResponse` from
+  `app/api/schemas.py` (Timeline `[27]`, Routes Graph node 20) and
+  `run_query` from `app/services/query_service.py` (Timeline `[26]`,
+  Routes Graph node 19). Imported by `app/main.py` (Timeline `[20]`,
+  Routes Graph node 16), which now just does
+  `app.include_router(router)` instead of defining the endpoint itself.
+  **Honest tradeoff**: catching bare `KeyError` is a little broad — some
+  unrelated bug could theoretically also raise one in this call path and
+  get misreported as "unknown company." A more precise fix would expose a
+  dedicated `is_known_company()` check from `nodes.py`'s registry and
+  validate before calling the graph at all — logged as a smaller open gap
+  in `CLAUDE.md`.
+  **Verified for real, twice** (once, then again after `app/main.py`
+  reverted on disk and had to be restored): unknown company → `404`,
+  blank question → `422`, valid question → `200` with the correct answer
+  — all three paths through the real router, over live HTTP.
+  **Verified for real**, both directly (6 test cases: valid input,
+  blank/whitespace-only question, blank company, over-length question, and
+  whitespace-trimming — all behaved correctly) and over live HTTP (blank
+  question → `422` with a useful message; valid question → `200` with the
+  correct answer).
 
 ### [21] evals/__init__.py
 - Motive: Marks `evals/` as a Python package for eval-related scripts
@@ -773,3 +877,27 @@ chat and in CLAUDE.md, not here).
   **Verified for real**: 10/10 adversarial examples correctly rejected on
   the first run — every forbidden keyword, both wrong-table references,
   and the statement-chaining injection attempt.
+
+### [26] app/services/query_service.py (Routes Graph node 19)
+- Motive: `cache.py` (lesson 4) has sat unused since it was built — this is
+  the file that actually wires Redis caching into the pipeline, so a
+  repeated question skips the LLM/DB work entirely.
+- Logic: `_extract_result(state)` narrows the full `GraphState` down to 5
+  JSON-safe fields (`generated_sql`, `sql_result`, `final_answer`,
+  `validation_error`, `execution_error`) — deliberately never
+  `retrieved_context`, which holds live ORM objects and isn't something a
+  caller needs anyway. `run_query(company, question)` builds a cache key
+  via `make_cache_key("query", company, question)`, returns immediately on
+  a `cache_get()` hit, and otherwise calls `graph.invoke()`, narrows the
+  result, and `cache_set()`s it — but only when both `validation_error`
+  and `execution_error` are `None`. A failure is deliberately never
+  cached: caching it would mean the exact same question stays stuck
+  returning that failure for the whole TTL, even after whatever caused it
+  (a transient DB timeout, an off-moment from the LLM) has resolved.
+  Imports `cache_get`/`cache_set`/`make_cache_key` from `app/core/cache.py`
+  (Timeline `[8]`, Routes Graph node 4) and `graph` from
+  `app/graph/graph.py` (Timeline `[19]`, Routes Graph node 15).
+  **Verified for real** over live HTTP (via `app/main.py`, updated in this
+  same lesson to call `run_query()` instead of `graph.invoke()` directly):
+  first request for a question took 22.6s; the identical second request
+  took 0.065s — a real cache hit, not just a plausible-looking design.
