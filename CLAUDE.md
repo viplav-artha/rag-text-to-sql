@@ -75,10 +75,18 @@ infrastructure (2 datasets + 2 experiment runners, which already found and
 fixed one real pipeline bug — see Known gaps). See "Files created so far"
 below and `NOTES.md` for the full file-by-file history.
 
-No further lessons are currently planned — future work would be genuinely
-new scope (e.g. a second company, hardening one of the logged Known gaps,
-or something the user decides next), not a continuation of this build
-order.
+No further lessons are currently planned — future work is genuinely new
+scope beyond the original build order, decided as it comes up. First
+addition post-build: a second endpoint, `POST /query/no-cache`, added at
+the user's explicit request — same request/response shape as `/query`,
+but deliberately bypasses Redis entirely (no `cache_get`/`cache_set`) so
+it always hits the real pipeline and database, useful for testing/
+debugging without a stale cached answer masking a real change. Backed by
+a new `run_query_no_cache()` in `query_service.py`, reusing the same
+`_extract_result()` shaping logic as `run_query()`. Verified for real:
+two identical requests both took full pipeline latency (no speedup on the
+second call, unlike `/query`'s ~0.065s cache-hit case), and a direct
+Redis check confirmed no cache entry was ever written for that question.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
 
 ## Planned build order
@@ -224,7 +232,10 @@ package markers are omitted from both (see the Maintenance instructions below).
     successes (`validation_error`/`execution_error` both `None`). Verified
     live over HTTP via `app/main.py` (now calling `run_query()` instead of
     `graph.invoke()` directly): first request 22.6s, identical second
-    request 0.065s (cache hit).
+    request 0.065s (cache hit). **Added post-build**: `run_query_no_cache()`
+    — same shape, reuses `_extract_result()`, but skips every cache step
+    entirely (no `cache_get`/`cache_set` at all), for the `/query/no-cache`
+    endpoint below.
 28. `app/api/__init__.py` — empty package marker for the `app.api` package
 29. `app/api/schemas.py` — `QueryRequest` (`company`/`question`, required,
     whitespace-stripped, rejected if blank, `question` capped at 500 chars
@@ -237,7 +248,13 @@ package markers are omitted from both (see the Maintenance instructions below).
     company into a clean `404` instead of an unhandled `500`. `app/main.py`
     now mounts this router via `include_router()` instead of defining the
     endpoint itself. All three paths (unknown company, blank question,
-    valid question) re-verified live over HTTP.
+    valid question) re-verified live over HTTP. **Added post-build**:
+    `POST /query/no-cache` — identical shape and error handling to
+    `/query`, calling `run_query_no_cache()` instead of `run_query()`.
+    Verified live: two identical requests both took full pipeline latency
+    (no cache-hit speedup), and a direct Redis check confirmed no cache
+    entry was ever written; unknown-company `404` handling confirmed on
+    this endpoint too.
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,
@@ -250,10 +267,11 @@ imports the three RAG store modules for table registration —
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
 - Run: `uvicorn app.main:app --reload` — the real, finished app as of
-  lesson 18: one `POST /query` endpoint
-  (`{"company": "futwork", "question": "..."}`), Redis-cached via
-  `query_service.py`, validated via `api/schemas.py`, routed via
-  `api/routes.py`, with a `lifespan` startup hook that bootstraps the
+  lesson 18, plus one post-build addition: two endpoints, both taking
+  `{"company": "futwork", "question": "..."}` — `POST /query` (Redis-cached
+  via `query_service.py`) and `POST /query/no-cache` (always hits the real
+  pipeline/database, never touches Redis) — validated via `api/schemas.py`,
+  routed via `api/routes.py`, with a `lifespan` startup hook that bootstraps the
   pgvector extension and RAG tables automatically
 - External services required, credentials supplied via `.env`:
   - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —

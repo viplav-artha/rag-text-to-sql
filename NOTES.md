@@ -187,7 +187,7 @@ graph TD
     n20["[27] app/api/schemas.py"]
     n21["[28] app/api/routes.py"]
     n20 -->|QueryRequest, QueryResponse| n21
-    n19 -->|run_query| n21
+    n19 -->|run_query, run_query_no_cache| n21
     n21 -->|router| n16
 ```
 
@@ -763,6 +763,16 @@ chat and in CLAUDE.md, not here).
   whitespace-trimming — all behaved correctly) and over live HTTP (blank
   question → `422` with a useful message; valid question → `200` with the
   correct answer).
+  **Added post-build**, at explicit user request: `POST /query/no-cache` —
+  identical shape and `KeyError`→`404` handling to `/query`, but calls
+  `run_query_no_cache()` instead of `run_query()`. Also imports
+  `run_query_no_cache` from `app/services/query_service.py` (Timeline
+  `[26]`, Routes Graph node 19) alongside the existing `run_query` import.
+  **Verified for real**: two identical requests both took full pipeline
+  latency with no cache-hit speedup on the second call, a direct
+  `cache_get()` check confirmed no cache entry was ever written for that
+  question, and the unknown-company `404` handling was confirmed on this
+  endpoint too.
 
 ### [21] evals/__init__.py
 - Motive: Marks `evals/` as a Python package for eval-related scripts
@@ -901,3 +911,16 @@ chat and in CLAUDE.md, not here).
   same lesson to call `run_query()` instead of `graph.invoke()` directly):
   first request for a question took 22.6s; the identical second request
   took 0.065s — a real cache hit, not just a plausible-looking design.
+  **Added post-build**, at explicit user request: `run_query_no_cache(
+  company, question)` — a deliberately dumber sibling function. No cache
+  key, no `cache_get()`, no `cache_set()` — just `graph.invoke()` and
+  `_extract_result()`, reusing the same shaping logic as `run_query()` so
+  the two functions' outputs are identical in structure, only their
+  caching behavior differs. Exists for `POST /query/no-cache` (see
+  `routes.py`'s note below) — a way to always get a fresh answer straight
+  from the pipeline/database, bypassing Redis entirely, useful for testing
+  or debugging without a stale cached answer masking a real change.
+  **Verified for real**: two identical requests through the no-cache
+  endpoint both took full pipeline latency (no second-call speedup), and a
+  direct `cache_get()` check confirmed no entry was ever written for that
+  question's cache key.

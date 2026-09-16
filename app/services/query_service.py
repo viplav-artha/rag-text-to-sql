@@ -28,3 +28,8 @@ def run_query(company: str, question: str) -> dict:
         cache_set(cache_key, result)
 
     return result
+
+
+def run_query_no_cache(company: str, question: str) -> dict:
+    state = graph.invoke({"company": company, "question": question})
+    return _extract_result(state)
