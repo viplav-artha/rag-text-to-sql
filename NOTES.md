@@ -32,7 +32,8 @@ study and are omitted here). Each node is numbered by creation order.
 [7] app/core/db.py
      |
      v
-[8] app/core/cache.py
+[8] app/core/cache.py (REMOVED post-build — Redis/caching deleted entirely,
+     see its File notes entry below)
      |
      v
 [9] app/rag/embeddings.py
@@ -138,8 +139,6 @@ graph TD
     n2["[6] app/core/config.py"]
     n3["[7] app/core/db.py"]
     n2 -->|get_settings| n3
-    n4["[8] app/core/cache.py"]
-    n2 -->|get_settings| n4
     n5["[9] app/rag/embeddings.py"]
     n2 -->|get_settings| n5
     n6["[10] app/rag/schema_store.py"]
@@ -178,7 +177,7 @@ graph TD
     n13 -->|detect_company_node, generate_sql_node, retrieve_node, validate_sql_node| n15
     n14 -->|execute_sql_node, format_answer_node| n15
     n16["[20] app/main.py"]
-    n3 -->|Base, engine, init_pgvector_extension| n16
+    n3 -->|RagBase, rag_engine| n16
     n17["[24] evals/run_financial_qa_eval.py"]
     n3 -->|db_session| n17
     n14 -->|_serialize_value| n17
@@ -186,12 +185,11 @@ graph TD
     n18["[25] evals/run_sql_safety_eval.py"]
     n13 -->|validate_sql_node| n18
     n19["[26] app/services/query_service.py"]
-    n4 -->|cache_get, cache_set, make_cache_key| n19
     n15 -->|graph| n19
     n20["[27] app/api/schemas.py"]
     n21["[28] app/api/routes.py"]
     n20 -->|QueryRequest, QueryResponse| n21
-    n19 -->|run_query, run_query_no_cache| n21
+    n19 -->|run_query| n21
     n21 -->|router| n16
     n22["[29] app/rag/vector_utils.py"]
     n22 -->|VectorJSON, cosine_similarity| n6
@@ -265,6 +263,12 @@ chat and in CLAUDE.md, not here).
   `redis_url`, since it has a working default and nothing requires the
   user to configure it explicitly. Used by `app/core/db.py`'s new
   `rag_engine` (see that file's note).
+  **Corrected post-hoc, Redis removed entirely**: `redis_url` and
+  `cache_ttl_seconds` deleted from `Settings`, the `REDIS_URL`-missing
+  `ValueError` check deleted, and `_env_int()` deleted along with them —
+  it had no other caller. `Settings` is now just `database_url`,
+  `embedding_model_name`, `rag_database_url`. No longer imported by
+  `app/core/cache.py`, since that file no longer exists.
 
 ### [7] app/core/db.py (Routes Graph node 3)
 - Motive: Give every part of the app that needs to read/write Neon Postgres
@@ -328,6 +332,20 @@ chat and in CLAUDE.md, not here).
   `settings.cache_ttl_seconds` if no explicit `ttl` is given. Imports
   `get_settings` from `app/core/config.py` (Timeline `[6]`, Routes Graph
   node 2).
+  **[REMOVED, post-build]**: deleted entirely, at explicit user request
+  ("we don't need caching anymore"). No replacement file — this whole
+  module (and the cache-aside pattern it enabled in `query_service.py`)
+  is simply gone. Routes Graph node 4 (this file) no longer appears in the
+  live diagram above, nor does its `n2 -->|get_settings| n4` edge or its
+  `n4 -->|cache_get, cache_set, make_cache_key| n19` edge into
+  `query_service.py` — both removed rather than left pointing at a
+  deleted file. `app/core/config.py` (Timeline `[6]`) lost the
+  `redis_url`/`cache_ttl_seconds` fields this file depended on;
+  `query_service.py` (Timeline `[26]`) lost its cache-check/cache-write
+  logic; `routes.py` (Timeline `[28]`) lost the now-redundant
+  `POST /query/no-cache` endpoint (with no cache, it would be identical to
+  `/query`). Verified for real: server runs and `/query` answers correctly
+  with Docker/Redis not even running.
 
 ### [9] app/rag/embeddings.py (Routes Graph node 5)
 - Motive: The schema store, example store, and retriever all need to turn
@@ -756,8 +774,12 @@ chat and in CLAUDE.md, not here).
   `SELECT * FROM (<sql>) AS limited_query LIMIT 500` so an unbounded query
   can't return an unbounded result. `_serialize_value()` converts `Decimal`
   (from `NUMERIC` columns) to `float` and `date`/`datetime` to ISO strings,
-  since raw DB types aren't JSON-safe and `cache_set()` (lesson 4) will
-  need to JSON-encode this data. `execute_sql_node(state)` first refuses to
+  since raw DB types aren't JSON-safe — originally because `cache_set()`
+  (lesson 4) needed to JSON-encode this data; that reason is gone now that
+  Redis/caching was removed entirely (see `cache.py`'s note), but the
+  serialization is still needed regardless, since `QueryResponse`
+  (`api/schemas.py`) still returns these values straight over HTTP.
+  `execute_sql_node(state)` first refuses to
   run if `state["validation_error"]` is still set (defense in depth against
   a future routing bug in `graph.py`, not just trusting upstream wiring),
   then opens a `db_session()`, sets a 10-second `SET LOCAL
@@ -989,6 +1011,14 @@ chat and in CLAUDE.md, not here).
   returned `200` with `company: "futwork"` correctly detected; the same
   endpoint with a question naming an unrecognized company returned a clean
   `404` with the detection-failure message.
+  **Corrected post-hoc, Redis removed entirely**: `POST /query/no-cache`
+  deleted outright, along with the `run_query_no_cache` import — once
+  there's no cache anywhere in the app, a "skip the cache" endpoint is
+  identical to the regular one, so keeping both would just be dead
+  duplication. This file is back down to the single `POST /query` handler
+  it started with. **Verified for real**: `POST /query/no-cache` now
+  correctly 404s (FastAPI's default for an undefined route), and `/query`
+  still returns correct answers with Docker/Redis not running.
 
 ### [21] evals/__init__.py
 - Motive: Marks `evals/` as a Python package for eval-related scripts
@@ -1151,6 +1181,19 @@ chat and in CLAUDE.md, not here).
   **Verified for real**: `run_query_no_cache("tell me the revenue of the
   futwork for june 2026")` correctly returned `company: "futwork"` in its
   result with no company argument passed in at all.
+  **Corrected post-hoc, Redis removed entirely**: this file shrank back
+  down to exactly what it needs and no more. `_is_cacheable()` deleted.
+  `run_query_no_cache()` deleted — redundant once there's no cache left to
+  bypass. `run_query(question)` is now just `graph.invoke()` +
+  `_extract_result()`, two lines, no cache key, no `cache_get()`/
+  `cache_set()`. The `app.core.cache` import is gone (that module no
+  longer exists). Everything this entry said above about cache hits/misses
+  describes historical behavior, not the current file — kept here rather
+  than deleted, per this project's convention of recording what changed
+  and why, not just the current end state. Imports only `graph` from
+  `app/graph/graph.py` (Timeline `[19]`, Routes Graph node 15) now.
+  **Verified for real**: a live `/query` request returns the correct
+  answer with Docker/Redis not running at all.
 
 ### [29] app/rag/vector_utils.py
 - Motive: Moving the RAG bookkeeping tables off Neon to a local SQLite

@@ -15,39 +15,24 @@ def _env(name: str, default: str | None = None) -> str | None:
     return value.strip()
 
 
-def _env_int(name: str, default: int) -> int:
-    value = _env(name)
-    if value in (None, ""):
-        return default
-    return int(value)
-
-
 @dataclass(frozen=True)
 class Settings:
     database_url: str
-    redis_url: str
     embedding_model_name: str
-    cache_ttl_seconds: int
     rag_database_url: str
 
 
 @lru_cache
 def get_settings() -> Settings:
     database_url = _env("DATABASE_URL")
-    redis_url = _env("REDIS_URL")
     embedding_model_name = _env("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-    cache_ttl_seconds = _env_int("CACHE_TTL_SECONDS", 3600)
     rag_database_url = _env("RAG_DATABASE_URL", "sqlite:///./rag_store.db")
 
     if not database_url:
         raise ValueError("DATABASE_URL not configured")
-    if not redis_url:
-        raise ValueError("REDIS_URL not configured")
 
     return Settings(
         database_url=database_url,
-        redis_url=redis_url,
         embedding_model_name=embedding_model_name,
-        cache_ttl_seconds=cache_ttl_seconds,
         rag_database_url=rag_database_url,
     )

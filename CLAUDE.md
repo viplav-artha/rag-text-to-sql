@@ -11,11 +11,12 @@ see below), then uses a LangGraph workflow (detect company → retrieve → gene
 validate → execute → format) driven by an AWS Bedrock LLM to produce and run the SQL,
 returning the answer. Embeddings for RAG retrieval use a local, open-source model
 (`sentence-transformers/all-MiniLM-L6-v2`, 384-dim) — no AWS dependency for that part, only
-the chat LLM uses Bedrock. Redis caches LLM output and SQL results to cut latency/cost on
-repeated or similar questions. The whole thing is exposed as a FastAPI service.
+the chat LLM uses Bedrock. The whole thing is exposed as a FastAPI service. There is
+deliberately no caching layer — every request runs the real pipeline; Redis was removed
+entirely at explicit user request, see Known gaps.
 Tech stack: Python, LangChain, LangGraph, langchain-aws (Bedrock chat LLM), sentence-transformers
 (local embeddings), FastAPI, SQLAlchemy, Neon Postgres (real financial data only), SQLite
-(RAG bookkeeping), Redis, LangSmith (evals).
+(RAG bookkeeping), LangSmith (evals).
 
 **Multi-tenant from the start:** every RAG knowledge row (`schema_chunks`, `few_shot_examples`,
 `company_profiles` — all three live in the local SQLite file, not Neon; originally lived in a
@@ -162,15 +163,37 @@ matching the old Neon-era counts exactly) and confirmed a live
 correctly. The old Neon `rag` schema tables were left in place, now
 orphaned/unused — not dropped automatically (a destructive Neon change
 wasn't part of this ask); worth cleaning up manually if desired.
-`DATABASE_URL` and `REDIS_URL` are both set in `.env`.
+
+Fifth post-build addition: Redis and all caching removed entirely, at
+explicit user request ("we don't need caching anymore"). Deleted
+`app/core/cache.py` outright (`get_redis_client()`, `make_cache_key()`,
+`cache_get()`/`cache_set()` — all gone). `app/core/config.py`'s `Settings`
+dropped `redis_url`/`cache_ttl_seconds`, and `_env_int()` was deleted too
+since caching was its only caller. `app/services/query_service.py`
+shrank back down to a single `run_query(question)` that just calls
+`graph.invoke()` and shapes the result — no cache check, no
+`_is_cacheable()`. Since a no-cache-vs-cached distinction no longer means
+anything, `POST /query/no-cache` was removed too (it would've been byte-
+for-byte identical to `/query` going forward) — `app/api/routes.py` is
+back down to the one `POST /query` endpoint. `redis` removed from
+`requirements.txt`; `REDIS_URL`/`CACHE_TTL_SECONDS` are no longer read by
+anything (harmless if still present in `.env`, just unused).
+`README.md`'s setup steps updated to drop the Redis/Docker step entirely
+— running the server no longer needs Docker at all. Verified for real:
+restarted the server with Docker not even running, confirmed clean
+startup, and a live `/query` request for "what was the total revenue for
+futwork in june 2026" returned the correct SQL and answer with zero Redis
+involvement; confirmed `/query/no-cache` now correctly 404s (route no
+longer exists).
+`DATABASE_URL` is set in `.env`.
 
 ## Planned build order
 Subject to adjustment as we go — update in place, don't just append.
 
 1. **DONE** — `app/core/llm.py` — Bedrock chat LLM wrapper (`get_llm()`), user-supplied code
-2. **DONE** — `app/core/config.py` — centralized settings (DB URL, Redis URL, embedding model, etc.)
+2. **DONE** — `app/core/config.py` — centralized settings (DB URL, embedding model, etc.)
 3. **DONE** — `app/core/db.py` — Neon Postgres engine/session + pgvector extension bootstrap
-4. **DONE** — `app/core/cache.py` — Redis client wrapper (get/set with TTL helpers)
+4. **DONE, later REMOVED** — `app/core/cache.py` — Redis client wrapper (get/set with TTL helpers) — deleted post-build when caching was removed entirely; see Known gaps and Current status
 5. **DONE** — `app/rag/embeddings.py` — open-source local embedding model wrapper (`all-MiniLM-L6-v2`, 384-dim)
 6. **DONE** — `app/rag/schema_store.py` — pgvector store for financial schema/column descriptions
    (corrected post-hoc: added `company` + `schema_name` fields, see lesson 9 note)
@@ -215,7 +238,14 @@ package markers are omitted from both (see the Maintenance instructions below).
 6. `app/core/config.py` — `get_settings()`, a cached `Settings` dataclass holding
    `DATABASE_URL`, `REDIS_URL`, `EMBEDDING_MODEL_NAME`, `CACHE_TTL_SECONDS`
    (field renamed from `embedding_model_id`/`BEDROCK_EMBEDDING_MODEL_ID` in
-   lesson 5 once embeddings moved off Bedrock to a local model)
+   lesson 5 once embeddings moved off Bedrock to a local model).
+   **Corrected post-hoc, RAG store moved off Neon entirely**: gained
+   `rag_database_url` (see lesson 10's note).
+   **Corrected post-hoc, Redis removed entirely**: `redis_url` and
+   `cache_ttl_seconds` deleted from `Settings`, along with the
+   `REDIS_URL`-missing validation and the now-unused `_env_int()` helper
+   (it had no other caller). `Settings` is down to `database_url`,
+   `embedding_model_name`, `rag_database_url`.
 7. `app/core/db.py` — SQLAlchemy engine/session (psycopg v3 driver), `Base` for
    ORM models, `get_db()` (FastAPI dependency), `db_session()` (context manager),
    `init_pgvector_extension()`. **Corrected post-hoc**: `init_pgvector_extension()`
@@ -225,7 +255,11 @@ package markers are omitted from both (see the Maintenance instructions below).
    `engine`/`SessionLocal`/`Base`/`db_session()` (Neon) are otherwise
    unchanged and now used only for the real financial data table.
 8. `app/core/cache.py` — Redis client singleton, `make_cache_key()`,
-   `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed)
+   `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed). **[REMOVED,
+   post-build]**: deleted entirely at explicit user request ("we don't
+   need caching anymore") — see Current status and Known gaps for the
+   full removal (also touched `config.py`, `query_service.py`,
+   `routes.py`, `requirements.txt`).
 9. `app/rag/embeddings.py` — `get_embeddings()`, cached `HuggingFaceEmbeddings`
    wrapper around `sentence-transformers/all-MiniLM-L6-v2` (local, 384-dim)
 10. `app/rag/schema_store.py` — `SchemaChunk` ORM model (`vector(384)` column,
@@ -381,6 +415,12 @@ package markers are omitted from both (see the Maintenance instructions below).
     `_extract_result()` also returns `company`/`company_detection_error`;
     `_is_cacheable()` now also requires `company_detection_error is None`
     before caching. Cache key is now `question`-only.
+    **Corrected post-hoc, Redis removed entirely**: back down to a single
+    `run_query(question)` — `graph.invoke()` then `_extract_result()`,
+    nothing else. `run_query_no_cache()` deleted (redundant once there's
+    no cache to bypass); `_is_cacheable()` deleted; the `app.core.cache`
+    import is gone. Verified live: a real `/query` request works correctly
+    with no Redis process running at all.
 28. `app/api/__init__.py` — empty package marker for the `app.api` package
 29. `app/api/schemas.py` — `QueryRequest` (`company`/`question`, required,
     whitespace-stripped, rejected if blank, `question` capped at 500 chars
@@ -414,6 +454,12 @@ package markers are omitted from both (see the Maintenance instructions below).
     `company: "futwork"` correctly detected; a question naming an
     unrecognized company returned a clean `404` with the detection-failure
     message.
+    **Corrected post-hoc, Redis removed entirely**: `POST /query/no-cache`
+    deleted along with its `run_query_no_cache` import — with no cache
+    left to bypass, it would've been identical to `/query`, so keeping
+    both would just be dead duplication. `app/api/routes.py` is back down
+    to the one `POST /query` handler. Verified live: `/query/no-cache` now
+    correctly 404s (route no longer exists), `/query` still works.
 31. `app/rag/vector_utils.py` — added post-build, when the RAG store moved
     off Neon/pgvector to a local SQLite file: `VectorJSON` (a
     `TypeDecorator` that JSON-encodes/decodes a `list[float]` embedding
@@ -433,15 +479,15 @@ imports the three RAG store modules for table registration —
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
 - Run: `uvicorn app.main:app --reload` — the real, finished app as of
-  lesson 18, plus post-build additions: two endpoints, both taking just
-  `{"question": "..."}` (no `company` field — the pipeline detects which
-  company the question is about itself, via `detect_company_node`) —
-  `POST /query` (Redis-cached via `query_service.py`) and
-  `POST /query/no-cache` (always hits the real pipeline/database, never
-  touches Redis) — validated via `api/schemas.py`, routed via
-  `api/routes.py`, with a `lifespan` startup hook that creates the local
-  SQLite RAG store (`rag_store.db`) automatically on first boot — no
-  pgvector/Neon bootstrap needed anymore for these tables
+  lesson 18, plus post-build additions: one endpoint, `POST /query`,
+  taking just `{"question": "..."}` (no `company` field — the pipeline
+  detects which company the question is about itself, via
+  `detect_company_node`) — always runs the real pipeline, no caching —
+  validated via `api/schemas.py`, routed via `api/routes.py`, with a
+  `lifespan` startup hook that creates the local SQLite RAG store
+  (`rag_store.db`) automatically on first boot — no pgvector/Neon
+  bootstrap needed anymore for these tables, and no Docker/Redis needed
+  to run the app at all anymore
 - External services required, credentials supplied via `.env`:
   - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —
     `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`, `AWS_PROFILE`,
@@ -469,13 +515,13 @@ imports the three RAG store modules for table registration —
     server starts (`app/main.py`'s `lifespan` hook), and by
     `scripts/ingest_knowledge.py` if run before the server ever has been.
     Not committed — covered by `.gitignore` (`*.db`).
-  - Redis (caching) — `REDIS_URL`. **Set in `.env`** as of lesson 6, pointing at
-    a local Redis running in Docker (`docker run -d --name rag-redis -p
-    6379:6379 redis:alpine`). Restart that container (`docker start rag-redis`)
-    if it's not running — data is not persisted across container removal.
   - Optional overrides: `EMBEDDING_MODEL_NAME` (default
     `sentence-transformers/all-MiniLM-L6-v2`, runs locally, no credentials
-    needed), `CACHE_TTL_SECONDS` (default `3600`)
+    needed)
+  - **[REMOVED]** Redis (caching) — was `REDIS_URL`, set in `.env` as of
+    lesson 6, pointing at a local Redis running in Docker. Deleted
+    entirely at explicit user request ("we don't need caching anymore") —
+    see Known gaps. Docker is no longer needed to run this app at all.
   - LangSmith (evals) — `LANGCHAIN_API_KEY`. **Set in `.env`**. The `langsmith`
     `Client()` reads this automatically; no code in this project needs to
     reference it directly.
@@ -488,10 +534,11 @@ imports the three RAG store modules for table registration —
   and `config.py` rather than shared from one utility module. Left as-is since
   `llm.py` is fixed user-supplied code; a natural later cleanup is a shared
   `app/core/env_utils.py` both files import from.
-- `cache_set()` (`app/core/cache.py`) JSON-encodes whatever it's given; callers
-  must pass plain JSON-serializable data (dicts/lists/strings/numbers), not raw
-  DB row objects or datetimes. Worth double-checking when `query_service.py`
-  (lesson 15) starts calling it.
+- **[MOOT — cache.py removed]** `cache_set()` (`app/core/cache.py`) JSON-encoded
+  whatever it was given; callers had to pass plain JSON-serializable data
+  (dicts/lists/strings/numbers), not raw DB row objects or datetimes. No
+  longer relevant — `app/core/cache.py` was deleted entirely when Redis
+  was removed (see the dedicated entry below).
 - `sentence-transformers`/`torch` are heavy dependencies (torch alone ~100MB+
   download, plus the ~80MB model weights downloaded on first run and cached in
   `~/.cache/huggingface`) — fine for a dev/prototype box, but worth remembering
@@ -696,6 +743,25 @@ imports the three RAG store modules for table registration —
   correctly generated `SELECT total_revenue FROM portfolio.futwork_vs_aop
   ...` and returned the right number. Worth checking row counts first
   whenever a query returns a suspiciously generic/wrong-looking SQL.
+- **[Redesigned]** Redis and all caching removed entirely, at explicit
+  user request. **Real tradeoff, not a pure win**: every `/query` request
+  now runs the full pipeline every time — two LLM calls (detect company,
+  generate SQL) plus a live Neon execution, with no shortcut for a
+  repeated or near-identical question. Before this, an identical repeat
+  question was a ~0.065s cache hit; now it's full latency (many seconds)
+  every time. This is the deliberate tradeoff the user asked for (`"we
+  don't need caching anymore"`), not an oversight — worth revisiting if
+  latency/cost on repeated questions becomes a real problem again, at
+  which point `app/core/cache.py` (and the cache-aside pattern in
+  `query_service.py`, both now deleted) would need to be rebuilt rather
+  than un-deleted, since they're gone from the codebase, not just
+  disabled. One upside beyond "the user asked for it": the app no longer
+  needs Docker/Redis running at all to work — one less moving part for
+  local dev and onboarding (see `README.md`'s simplified setup steps).
+  Verified for real: restarted the server with Docker not running,
+  confirmed clean startup and a correct `/query` response; confirmed
+  `POST /query/no-cache` now correctly 404s since the route was removed
+  (it would've been identical to `/query` with no cache to bypass).
 
 ## Companion file
 See `NOTES.md` for the plain-language, no-analogy study notes, the file-creation

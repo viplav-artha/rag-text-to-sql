@@ -3,7 +3,6 @@ python-dotenv
 langchain-aws
 sqlalchemy
 psycopg[binary]
-redis
 langchain-huggingface
 sentence-transformers
 langgraph
