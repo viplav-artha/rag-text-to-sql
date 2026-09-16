@@ -4,8 +4,9 @@ from app.rag.retriever import RetrievedContext
 
 
 class GraphState(TypedDict):
-    company: str
     question: str
+    company: NotRequired[str]
+    company_detection_error: NotRequired[str | None]
     retrieved_context: NotRequired[RetrievedContext | None]
     generated_sql: NotRequired[str | None]
     validation_error: NotRequired[str | None]

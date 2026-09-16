@@ -6,6 +6,8 @@ _CACHE_NAMESPACE = "query"
 
 def _extract_result(state: dict) -> dict:
     return {
+        "company": state.get("company"),
+        "company_detection_error": state.get("company_detection_error"),
         "generated_sql": state.get("generated_sql"),
         "sql_result": state.get("sql_result"),
         "final_answer": state.get("final_answer"),
@@ -14,22 +16,30 @@ def _extract_result(state: dict) -> dict:
     }
 
 
-def run_query(company: str, question: str) -> dict:
-    cache_key = make_cache_key(_CACHE_NAMESPACE, company, question)
+def _is_cacheable(result: dict) -> bool:
+    return (
+        result["company_detection_error"] is None
+        and result["validation_error"] is None
+        and result["execution_error"] is None
+    )
+
+
+def run_query(question: str) -> dict:
+    cache_key = make_cache_key(_CACHE_NAMESPACE, question)
 
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
 
-    state = graph.invoke({"company": company, "question": question})
+    state = graph.invoke({"question": question})
     result = _extract_result(state)
 
-    if result["validation_error"] is None and result["execution_error"] is None:
+    if _is_cacheable(result):
         cache_set(cache_key, result)
 
     return result
 
 
-def run_query_no_cache(company: str, question: str) -> dict:
-    state = graph.invoke({"company": company, "question": question})
+def run_query_no_cache(question: str) -> dict:
+    state = graph.invoke({"question": question})
     return _extract_result(state)

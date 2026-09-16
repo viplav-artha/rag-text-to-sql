@@ -2,10 +2,9 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class QueryRequest(BaseModel):
-    company: str = Field(..., min_length=1, max_length=64)
     question: str = Field(..., min_length=1, max_length=500)
 
-    @field_validator("company", "question")
+    @field_validator("question")
     @classmethod
     def _strip_and_reject_blank(cls, value: str) -> str:
         stripped = value.strip()
@@ -15,6 +14,8 @@ class QueryRequest(BaseModel):
 
 
 class QueryResponse(BaseModel):
+    company: str | None = None
+    company_detection_error: str | None = None
     generated_sql: str | None = None
     sql_result: list[dict] | None = None
     final_answer: str | None = None

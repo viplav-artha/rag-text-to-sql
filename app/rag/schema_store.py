@@ -1,14 +1,13 @@
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import Boolean, String, Text, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from app.core.db import Base
+from app.core.db import RagBase
 from app.rag.embeddings import get_embeddings
+from app.rag.vector_utils import VectorJSON, cosine_similarity
 
 
-class SchemaChunk(Base):
+class SchemaChunk(RagBase):
     __tablename__ = "schema_chunks"
-    __table_args__ = {"schema": "rag"}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company: Mapped[str] = mapped_column(String(64))
@@ -16,7 +15,7 @@ class SchemaChunk(Base):
     table_name: Mapped[str] = mapped_column(String(128))
     column_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     description: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list[float]] = mapped_column(Vector(384))
+    embedding: Mapped[list[float]] = mapped_column(VectorJSON)
     is_per_entity: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -55,5 +54,6 @@ def search_schema(
     stmt = select(SchemaChunk).where(SchemaChunk.company == company)
     if is_per_entity is not None:
         stmt = stmt.where(SchemaChunk.is_per_entity == is_per_entity)
-    stmt = stmt.order_by(SchemaChunk.embedding.cosine_distance(vector)).limit(top_k)
-    return list(db.execute(stmt).scalars().all())
+    candidates = list(db.execute(stmt).scalars().all())
+    candidates.sort(key=lambda chunk: cosine_similarity(vector, chunk.embedding), reverse=True)
+    return candidates[:top_k]

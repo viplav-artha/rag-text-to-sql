@@ -95,6 +95,10 @@ study and are omitted here). Each node is numbered by creation order.
 [28] app/api/routes.py  <-- BUILD COMPLETE (all 18 planned lessons done;
      lesson 18 only edited [20] app/main.py further, no new file — see its
      updated note below)
+     |
+     v
+[29] app/rag/vector_utils.py (post-build, added when the RAG store moved
+     off Neon/pgvector to a local SQLite file — see its own note)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -171,7 +175,7 @@ graph TD
     n12 -->|GraphState| n14
     n15["[19] app/graph/graph.py"]
     n12 -->|GraphState| n15
-    n13 -->|generate_sql_node, retrieve_node, validate_sql_node| n15
+    n13 -->|detect_company_node, generate_sql_node, retrieve_node, validate_sql_node| n15
     n14 -->|execute_sql_node, format_answer_node| n15
     n16["[20] app/main.py"]
     n3 -->|Base, engine, init_pgvector_extension| n16
@@ -189,6 +193,9 @@ graph TD
     n20 -->|QueryRequest, QueryResponse| n21
     n19 -->|run_query, run_query_no_cache| n21
     n21 -->|router| n16
+    n22["[29] app/rag/vector_utils.py"]
+    n22 -->|VectorJSON, cosine_similarity| n6
+    n22 -->|VectorJSON, cosine_similarity| n7
 ```
 
 ## File notes
@@ -252,6 +259,12 @@ chat and in CLAUDE.md, not here).
   (Note: the embedding field/env-var was renamed from `embedding_model_id`/
   `BEDROCK_EMBEDDING_MODEL_ID` in lesson 5, when embeddings moved off Bedrock
   to a local open-source model — updated here to stay accurate.)
+  **Corrected post-hoc, RAG store moved off Neon entirely**: `Settings`
+  gained `rag_database_url`, read via `_env("RAG_DATABASE_URL",
+  "sqlite:///./rag_store.db")` — optional, unlike `database_url`/
+  `redis_url`, since it has a working default and nothing requires the
+  user to configure it explicitly. Used by `app/core/db.py`'s new
+  `rag_engine` (see that file's note).
 
 ### [7] app/core/db.py (Routes Graph node 3)
 - Motive: Give every part of the app that needs to read/write Neon Postgres
@@ -278,6 +291,26 @@ chat and in CLAUDE.md, not here).
   raised `DetachedInstanceError` the instant their attributes were accessed
   outside that session — discovered when `generate_sql_node()` tried to read
   `chunk.schema_name` after `retrieve_node()`'s session had already closed.
+  **Corrected post-hoc, RAG store moved off Neon entirely**: at explicit
+  user request, this file now manages *two* separate databases instead of
+  one. Everything above (`engine`, `SessionLocal`, `Base`, `get_db()`,
+  `db_session()`) is unchanged and still points at Neon — but `Base` no
+  longer has any models registered on it, since all three RAG bookkeeping
+  tables moved to the new SQLite side below; Neon's only remaining job is
+  the real financial data table, queried with raw SQL, never the ORM.
+  `init_pgvector_extension()` was deleted outright — nothing in the project
+  uses pgvector anymore. New: `rag_engine` (`create_engine(settings.
+  rag_database_url, connect_args={"check_same_thread": False})` — the
+  `check_same_thread` override is needed because FastAPI runs sync
+  endpoints in a threadpool, not necessarily the thread that opened the
+  SQLite connection), `RagSessionLocal` (same shape as `SessionLocal`,
+  `expire_on_commit=False` too, for the same detached-instance reason), a
+  new empty `RagBase` for the RAG models to inherit from instead of `Base`,
+  and `rag_db_session()` — a context manager identical in behavior to
+  `db_session()`, just bound to `RagSessionLocal`. `rag_database_url`
+  (from `app/core/config.py`, defaulting to `sqlite:///./rag_store.db`)
+  is a local file path, not a network connection — no server to spin up,
+  no credentials needed, which is the whole point of this move.
 
 ### [8] app/core/cache.py (Routes Graph node 4)
 - Motive: Give `query_service.py` (and anything else that wants to cache
@@ -369,6 +402,36 @@ chat and in CLAUDE.md, not here).
   three RAG bookkeeping tables under one dedicated schema, separate from
   Postgres's default `public`. Same drop/recreate/re-ingest cycle as
   before; re-verified retrieval and the live `/query` endpoint afterward.
+  **Corrected post-hoc, moved off Neon entirely**: at explicit user
+  request, all three RAG bookkeeping tables (this one included) moved from
+  the Neon `rag` schema to a local SQLite file (`rag_store.db`, created
+  automatically at server startup — see `app/main.py`'s note). Neon now
+  holds only the real financial data table
+  (`portfolio.futwork_vs_aop`) — queried directly with raw SQL, never
+  through this ORM. Three changes here specifically: (1) `SchemaChunk` now
+  subclasses `RagBase` (new, in `app/core/db.py`) instead of `Base`, and
+  dropped `__table_args__ = {"schema": "rag"}` entirely — SQLite has no
+  Postgres-style schema namespacing, and doesn't need one since the whole
+  file is already dedicated to RAG bookkeeping; (2) `embedding` changed
+  from pgvector's `Vector(384)` to a new `VectorJSON` type (in the new
+  `app/rag/vector_utils.py`) — a `TypeDecorator` that JSON-encodes/decodes
+  a `list[float]` into a `Text` column, since SQLite has no native vector
+  type; (3) `search_schema()` no longer runs `ORDER BY embedding <=>
+  :vector LIMIT top_k` in SQL (SQLite can't do that) — it now fetches every
+  row matching the `company`/`is_per_entity` filters, ranks them in Python
+  with a new `cosine_similarity()` helper (also in `vector_utils.py`,
+  plain-Python dot-product/norm math, no new dependency), and slices the
+  top `top_k` in-process. Fine at this data size (177 rows total for one
+  company) — would need reconsidering if a company's schema knowledge grew
+  into the tens of thousands of rows. Imports `RagBase` from
+  `app/core/db.py` (Timeline `[7]`, Routes Graph node 3) instead of `Base`.
+  **Verified for real**: deleted `rag_store.db`, started the server fresh
+  (confirmed all three tables auto-created, empty), ran
+  `scripts/ingest_knowledge.py` (177 chunks + 5 examples, matching the old
+  Neon counts exactly), and a live `/query/no-cache` request correctly
+  retrieved context and answered "What was the total revenue in June
+  2026?" with the right INR figure — same result quality as before the
+  move, now with zero pgvector/Neon involvement for retrieval.
 
 ### [11] app/rag/example_store.py (Routes Graph node 7)
 - Motive: Give few-shot NL→SQL examples (question paired with the correct
@@ -393,6 +456,12 @@ chat and in CLAUDE.md, not here).
   **Corrected post-hoc again**, at explicit user request: also gained
   `__table_args__ = {"schema": "rag"}`, moving it to `rag.few_shot_examples`
   — see `schema_store.py`'s note above for the full rationale.
+  **Corrected post-hoc, moved off Neon entirely**: same treatment as
+  `schema_store.py` above — now subclasses `RagBase` (not `Base`), dropped
+  `__table_args__`, `embedding` is `VectorJSON` instead of `Vector(384)`,
+  and `search_examples()` ranks candidates in Python via
+  `cosine_similarity()` instead of a pgvector `ORDER BY` clause. Lives in
+  the same local `rag_store.db` SQLite file as the other two RAG tables.
 
 ### [12] app/rag/retriever.py (Routes Graph node 8)
 - Motive: The SQL-generation node (built next in the `app/graph/` lessons)
@@ -465,6 +534,13 @@ chat and in CLAUDE.md, not here).
   — see `schema_store.py`'s note (Timeline `[10]`) for the full rationale.
   The Futwork profile was re-upserted for real via re-running
   `ingest_knowledge.py` after the move.
+  **Corrected post-hoc, moved off Neon entirely**: same treatment as the
+  other two RAG tables — now subclasses `RagBase` instead of `Base`,
+  dropped `__table_args__` (SQLite doesn't need a schema namespace here).
+  No embedding column on this model to begin with, so no `VectorJSON`
+  change was needed. Lives in the local `rag_store.db` SQLite file. The
+  Futwork profile was re-upserted for real via re-running
+  `ingest_knowledge.py` against the fresh SQLite store.
 
 ### [14] data/companies/futwork.py (Routes Graph node 10)
 - Motive: Separates *data* (what the 67 metrics mean, the per-client
@@ -488,6 +564,13 @@ chat and in CLAUDE.md, not here).
   case-sensitive, so every example's SQL silently matched zero rows despite
   being otherwise correct. Fixed to lowercase and re-ingested; see
   `nodes.py`'s note below for the matching system-prompt fix.
+  **Corrected post-hoc, company/table-routing redesign**: added `TABLES`, a
+  list of `{schema, table, description}` dicts (currently one entry, built
+  from the existing `SCHEMA_NAME`/`TABLE_NAME`). `SCHEMA_NAME`/`TABLE_NAME`
+  themselves are unchanged and still used by `ingest_knowledge.py` for
+  column introspection — `TABLES` is a separate, query-time registry read
+  by `nodes.py` so the LLM (not Python) picks which table to query. See
+  `nodes.py`'s matching note below.
 
 ### [15] scripts/ingest_knowledge.py (Routes Graph node 11)
 - Motive: Turns the data in `futwork.py` into real rows in all three RAG
@@ -528,15 +611,30 @@ chat and in CLAUDE.md, not here).
   script was updated (and the whole table re-ingested from scratch) as part
   of the retrieval-crowding-out bug fix documented in `schema_store.py`'s
   and `retriever.py`'s notes above.
-
-### [16] app/graph/state.py (Routes Graph node 12)
+  **Corrected post-hoc, RAG store moved off Neon entirely**: `db_session`
+  import replaced with `rag_db_session` — every write (`delete()`,
+  `upsert_company_profile()`, `add_schema_chunk()`, `add_example()`) now
+  targets the local SQLite file instead of Neon. `engine` (Neon) is still
+  imported and still used for `inspect(engine)`'s column introspection —
+  that part is unchanged, since the real column list still lives in
+  Neon's `portfolio.futwork_vs_aop`; only the *bookkeeping* about those
+  columns moved. Also added one line at the top of `ingest()`:
+  `RagBase.metadata.create_all(rag_engine)` — this script can now run
+  standalone against a brand-new machine with no `rag_store.db` yet
+  (previously the tables only got created by `app/main.py`'s lifespan
+  hook, so running this script before ever starting the server failed
+  with `no such table: schema_chunks`). **Verified for real**: deleted
+  `rag_store.db`, ran this script directly (no server started first) —
+  it created the file and all three tables itself, then ingested 177
+  schema chunks + 5 examples, exactly matching the old Neon-era counts.
 - Motive: Every LangGraph node in this workflow reads from and writes to
   one shared object rather than calling each other directly. Without a
   single agreed-upon shape for that object, a typo in one node's dict key
   would fail silently at runtime instead of being caught upfront.
 - Logic: `GraphState` is a single `TypedDict` covering the whole pipeline:
-  `company`/`question` are the only required fields (supplied by whoever
-  starts the graph); `retrieved_context` (set by the retrieve node),
+  `question` is the only required field (supplied by whoever starts the
+  graph); `company`/`company_detection_error` (set by the detect-company
+  node — see the correction note below), `retrieved_context` (set by the retrieve node),
   `generated_sql`/`validation_error`/`retry_count` (set by the generate/
   validate nodes — `validation_error` drives a conditional retry edge, and
   `retry_count` caps how many retries are allowed), `sql_result`/
@@ -547,6 +645,14 @@ chat and in CLAUDE.md, not here).
   `app/rag/retriever.py` (Timeline `[12]`, Routes Graph node 8). Verified
   by constructing a minimal `GraphState` with only `company`/`question`
   set, confirming the `NotRequired` fields are genuinely optional.
+  **Corrected post-hoc, company auto-detection**: `company` moved from a
+  required field to `NotRequired`, since it's no longer supplied by the
+  API caller — it's derived from `question` by the new `detect_company`
+  node (see `nodes.py`/`graph.py` notes below) and only exists in state
+  once that node has run. Added `company_detection_error` alongside it —
+  `None` on a successful match, a message otherwise — so the graph can
+  short-circuit to `END` before ever reaching `retrieve`/`generate`
+  (which assume `company` is set) when detection fails.
 
 ### [17] app/graph/nodes.py (Routes Graph node 13)
 - Motive: This is where the pipeline's actual intelligence lives — turning
@@ -557,18 +663,24 @@ chat and in CLAUDE.md, not here).
   not a plugin system, since there's one company today.
   `_strip_code_fences()` defensively removes markdown code fences an LLM
   might wrap SQL in despite being told not to. `retrieve_node(state)` opens
-  a `db_session()`, calls `retrieve_context()`, and returns
+  a `rag_db_session()` (**corrected post-hoc**, was `db_session()` — the
+  RAG bookkeeping tables `retrieve_context()` reads from moved off Neon to
+  a local SQLite file, see `app/core/db.py`'s note; this node's own logic
+  is otherwise unchanged), calls `retrieve_context()`, and returns
   `{"retrieved_context": ...}` for LangGraph to merge into state.
-  `generate_sql_node(state)` builds a system prompt naming the one table
-  this company may query (read dynamically from its data module, not
-  hardcoded text) plus the retrieved context and question, appends the
-  previous validation error to the prompt on a retry (so the LLM can
-  self-correct), calls `get_llm()`, and strips code fences from the
-  response. `validate_sql_node(state)` rejects anything that isn't a
-  `SELECT`, rejects a fixed list of forbidden keywords
-  (`INSERT`/`UPDATE`/`DELETE`/`DROP`/etc., via `\b`-bounded regex so
-  `DROPDOWN` doesn't false-positive on `DROP`), and rejects SQL that
-  doesn't reference the allowed table — each failure sets
+  `generate_sql_node(state)` builds a system prompt listing every table in
+  this company's `TABLES` registry (schema + table + one-line description
+  each, read dynamically from its data module) and tells the LLM to pick
+  whichever one actually matches the question — Python never picks the
+  table itself, it only supplies the allowed set — plus the retrieved
+  context and question, appends the previous validation error to the
+  prompt on a retry (so the LLM can self-correct), calls `get_llm()`, and
+  strips code fences from the response. `validate_sql_node(state)` rejects
+  anything that isn't a `SELECT`, rejects a fixed list of forbidden
+  keywords (`INSERT`/`UPDATE`/`DELETE`/`DROP`/etc., via `\b`-bounded regex
+  so `DROPDOWN` doesn't false-positive on `DROP`), and rejects SQL that
+  doesn't reference *any* table in the company's `TABLES` list (checked via
+  `_table_in_sql()` against every entry, not one fixed string) — each failure sets
   `validation_error` and increments `retry_count`, but the actual
   retry-vs-proceed *decision* belongs to `graph.py` (lesson 14), not this
   node. Imports `get_llm` from `app/core/llm.py` (Timeline `[5]`, Routes
@@ -587,6 +699,53 @@ chat and in CLAUDE.md, not here).
   questions (total revenue, per-client billing, caller churn, runway) after
   the retrieval-crowding-out bug (documented in `schema_store.py`'s and
   `retriever.py`'s notes) was found and fixed via this same testing.
+  **Corrected post-hoc, company/table-routing redesign**: `generate_sql_node`
+  and `validate_sql_node` previously computed a single `allowed_table`
+  string (`f"{company_data.SCHEMA_NAME}.{company_data.TABLE_NAME}"`) and
+  either told the LLM to use exactly that table or rejected SQL that didn't
+  contain it — the table choice was made in Python, not by the LLM, and the
+  design assumed exactly one table per company. Replaced with
+  `_format_allowed_tables()` (renders the company's `TABLES` list as
+  markdown-ish bullet lines for the prompt) and `_table_in_sql()` (checks
+  one table dict against the SQL string); `generate_sql_node` now shows the
+  LLM the whole list and asks it to choose, and `validate_sql_node` accepts
+  SQL referencing *any* entry in that list. `_COMPANY_DATA` is unchanged —
+  it still decides which companies exist at all (a `KeyError` on an unknown
+  company is unaffected); this redesign only changes how table selection
+  works *within* one already-known company. Verified locally first, by
+  exercising `_get_company_data()`/`_format_allowed_tables()`/
+  `_table_in_sql()` directly: correct SQL against `portfolio.futwork_vs_aop`
+  matches, SQL against an unrelated table doesn't, and an unknown company
+  still raises `KeyError`. **Then verified for real** via
+  `POST /query/no-cache` against live Bedrock + Neon: "What was the total
+  revenue in March 2026?" → the LLM, given the `TABLES` list instead of a
+  single dictated table string, picked `portfolio.futwork_vs_aop` itself
+  and generated valid SQL against it on the first try (no validation
+  retry), with the correct answer.
+  **Corrected post-hoc, company auto-detection**: added
+  `detect_company_node(state)` and a `_format_known_companies()` helper.
+  Previously the caller had to pass `company` explicitly in every request;
+  now the pipeline itself figures out which company a question is about.
+  `_format_known_companies()` iterates `_COMPANY_DATA` and renders each
+  company's key plus the first sentence of its `PROFILE` as one bullet
+  line — the same registry `_get_company_data()` already used, reused here
+  rather than a second list to keep in sync. `detect_company_node` puts
+  that list in a system prompt, asks the LLM to reply with only the
+  matching company key (or the literal string `UNKNOWN`), and normalizes
+  the response (`.strip().strip(".\"'").lower()`) before checking it
+  against `_COMPANY_DATA`. A match sets `{"company": ..., "company_detection_error":
+  None}`; anything else — including `UNKNOWN` or a hallucinated key not in
+  the registry — sets `company_detection_error` instead of guessing, and
+  never sets `company` at all. This runs *before* `retrieve_node`/
+  `generate_sql_node`/`validate_sql_node`, all of which still read
+  `state["company"]` directly and are otherwise unchanged — they simply
+  never run when detection fails, because `graph.py`'s new conditional
+  edge routes straight to `END` in that case (see its note below).
+  **Verified for real** against live Bedrock: "tell me the revenue of the
+  futwork for june 2026" correctly detected `company="futwork"` with no
+  company field in the request at all, and a question naming an unrecognized
+  company ("acme corp") correctly came back as `company_detection_error`
+  set (surfaced as a `404` by `routes.py`) rather than a crash or a guess.
 
 ### [18] app/graph/execute_node.py (Routes Graph node 14)
 - Motive: Validated SQL still has to actually run against Neon, and raw
@@ -658,6 +817,24 @@ chat and in CLAUDE.md, not here).
   error with retries remaining → generate; error with retries exhausted →
   execute (where `execute_sql_node`'s defense-in-depth guard from lesson 13
   catches it and reports failure cleanly instead of running bad SQL).
+  **Corrected post-hoc, company auto-detection**: added
+  `_route_after_detect_company(state)` (returns `"end"` if
+  `company_detection_error` is set, else `"retrieve"`) and a new
+  `detect_company` node, registered first in the graph. The fixed path is
+  now `START → detect_company`, then a conditional edge
+  (`add_conditional_edges("detect_company", _route_after_detect_company,
+  {"retrieve": "retrieve", "end": END})`) into the rest of the previously-fixed
+  chain (`retrieve → generate → validate → ... → execute → format → END`),
+  which is otherwise unchanged. This means a request that doesn't name a
+  known company now ends the graph immediately after one LLM call, rather
+  than reaching `retrieve_node` and raising a `KeyError` on
+  `state["company"]`. Imports `detect_company_node` alongside the other
+  three from `app/graph/nodes.py`. **Verified for real**:
+  `graph.invoke({"question": "tell me the revenue of the futwork for june
+  2026"})` — no `company` key in the input at all — correctly detected
+  `futwork` and returned the right answer; a question naming an unknown
+  company correctly stopped at `detect_company` with
+  `company_detection_error` set and no further nodes run.
 
 ### [20] app/main.py (Routes Graph node 16)
 - Motive: Built out of build-order sequence at lesson 12, at explicit user
@@ -706,6 +883,20 @@ chat and in CLAUDE.md, not here).
   `rag.company_profiles` were unchanged after restart (177/5/1 —
   `create_all()` only creates tables that don't exist, never touches ones
   that do), and `/query` still returned a correct real answer afterward.
+  **Corrected post-hoc, RAG store moved off Neon entirely**: the lifespan
+  hook now runs `RagBase.metadata.create_all(rag_engine)` instead of
+  `init_pgvector_extension()` + `Base.metadata.create_all(engine)` —
+  `init_pgvector_extension()` was deleted from `db.py` entirely (nothing
+  uses pgvector anymore), and `Base`/`engine` (Neon) no longer have any
+  ORM models registered on them to create in the first place. Imports
+  `RagBase`/`rag_engine` from `app/core/db.py` instead of `Base`/`engine`.
+  **Verified for real**: deleted `rag_store.db`, started the server with
+  no file present at all — it created `rag_store.db` and all three tables
+  (`schema_chunks`, `few_shot_examples`, `company_profiles`) automatically
+  on first boot, exactly as intended ("these tables should be created
+  using SQLite during runtime, on the local machine, the first time the
+  server starts"). Re-ran `scripts/ingest_knowledge.py` afterward and
+  confirmed a live `/query/no-cache` request still worked end-to-end.
 
 ### [27] app/api/schemas.py (Routes Graph node 20)
 - Motive: The request/response contract for the API deserves its own file
@@ -727,6 +918,13 @@ chat and in CLAUDE.md, not here).
   `CLAUDE.md`'s Known gaps (now fixed — see `app/api/routes.py`'s note
   below). Imported by `app/api/routes.py` (Timeline `[28]`, Routes Graph
   node 21) — no longer imported directly by `app/main.py`.
+  **Corrected post-hoc, company auto-detection**: `QueryRequest` dropped
+  `company` entirely — a request is now just `{"question": "..."}`, since
+  the pipeline detects the company itself (see `nodes.py`'s
+  `detect_company_node` note). `QueryResponse` gained `company: str | None`
+  and `company_detection_error: str | None`, both defaulting to `None`, so
+  the caller can see which company was detected (or why detection failed)
+  without a separate lookup.
 
 ### [28] app/api/routes.py (Routes Graph node 21)
 - Motive: Separates "what the `/query` endpoint does" from "how the
@@ -773,6 +971,24 @@ chat and in CLAUDE.md, not here).
   `cache_get()` check confirmed no cache entry was ever written for that
   question, and the unknown-company `404` handling was confirmed on this
   endpoint too.
+  **Corrected post-hoc, company auto-detection**: both handlers dropped
+  `request.company` — they now call `run_query(request.question)` /
+  `run_query_no_cache(request.question)` with no company argument. The
+  `try`/`except KeyError` wrapper is gone too, since `_get_company_data()`
+  can no longer receive an unrecognized company (`detect_company_node`
+  guarantees `company` is only ever set to a key already in
+  `_COMPANY_DATA`, or not set at all). Detection failure is now surfaced
+  as a plain state field instead of an exception: both handlers check
+  `result["company_detection_error"]` and raise the same
+  `HTTPException(status_code=404, ...)` as before if it's set, using the
+  message the graph produced instead of a hardcoded one. This closes the
+  "bare `KeyError` is a little broad" gap noted above by construction —
+  there's no longer a `KeyError` in this call path to be ambiguous about.
+  **Verified for real**: `POST /query/no-cache` with only `{"question":
+  "tell me the revenue of the futwork for june 2026"}` (no `company` key)
+  returned `200` with `company: "futwork"` correctly detected; the same
+  endpoint with a question naming an unrecognized company returned a clean
+  `404` with the detection-failure message.
 
 ### [21] evals/__init__.py
 - Motive: Marks `evals/` as a Python package for eval-related scripts
@@ -892,18 +1108,21 @@ chat and in CLAUDE.md, not here).
 - Motive: `cache.py` (lesson 4) has sat unused since it was built — this is
   the file that actually wires Redis caching into the pipeline, so a
   repeated question skips the LLM/DB work entirely.
-- Logic: `_extract_result(state)` narrows the full `GraphState` down to 5
-  JSON-safe fields (`generated_sql`, `sql_result`, `final_answer`,
-  `validation_error`, `execution_error`) — deliberately never
-  `retrieved_context`, which holds live ORM objects and isn't something a
-  caller needs anyway. `run_query(company, question)` builds a cache key
-  via `make_cache_key("query", company, question)`, returns immediately on
-  a `cache_get()` hit, and otherwise calls `graph.invoke()`, narrows the
-  result, and `cache_set()`s it — but only when both `validation_error`
-  and `execution_error` are `None`. A failure is deliberately never
-  cached: caching it would mean the exact same question stays stuck
-  returning that failure for the whole TTL, even after whatever caused it
-  (a transient DB timeout, an off-moment from the LLM) has resolved.
+- Logic: `_extract_result(state)` narrows the full `GraphState` down to 7
+  JSON-safe fields (`company`, `company_detection_error`, `generated_sql`,
+  `sql_result`, `final_answer`, `validation_error`, `execution_error`) —
+  deliberately never `retrieved_context`, which holds live ORM objects and
+  isn't something a caller needs anyway. `_is_cacheable(result)` is `True`
+  only when `company_detection_error`, `validation_error`, and
+  `execution_error` are all `None`. `run_query(question)` builds a cache
+  key via `make_cache_key("query", question)`, returns immediately on a
+  `cache_get()` hit, and otherwise calls `graph.invoke()`, narrows the
+  result, and `cache_set()`s it only when `_is_cacheable()` says so. A
+  failure is deliberately never cached: caching it would mean the exact
+  same question stays stuck returning that failure for the whole TTL, even
+  after whatever caused it (a transient DB timeout, an off-moment from the
+  LLM) has resolved — and that now includes a failed company detection,
+  not just a validation/execution failure.
   Imports `cache_get`/`cache_set`/`make_cache_key` from `app/core/cache.py`
   (Timeline `[8]`, Routes Graph node 4) and `graph` from
   `app/graph/graph.py` (Timeline `[19]`, Routes Graph node 15).
@@ -912,8 +1131,8 @@ chat and in CLAUDE.md, not here).
   first request for a question took 22.6s; the identical second request
   took 0.065s — a real cache hit, not just a plausible-looking design.
   **Added post-build**, at explicit user request: `run_query_no_cache(
-  company, question)` — a deliberately dumber sibling function. No cache
-  key, no `cache_get()`, no `cache_set()` — just `graph.invoke()` and
+  question)` — a deliberately dumber sibling function. No cache key, no
+  `cache_get()`, no `cache_set()` — just `graph.invoke()` and
   `_extract_result()`, reusing the same shaping logic as `run_query()` so
   the two functions' outputs are identical in structure, only their
   caching behavior differs. Exists for `POST /query/no-cache` (see
@@ -924,3 +1143,37 @@ chat and in CLAUDE.md, not here).
   endpoint both took full pipeline latency (no second-call speedup), and a
   direct `cache_get()` check confirmed no entry was ever written for that
   question's cache key.
+  **Corrected post-hoc, company auto-detection**: both `run_query()` and
+  `run_query_no_cache()` dropped their `company` parameter — they now take
+  only `question`, since `company` is derived inside the graph by
+  `detect_company_node` rather than supplied by the caller. The cache key
+  is now built from `question` alone (`make_cache_key("query", question)`).
+  **Verified for real**: `run_query_no_cache("tell me the revenue of the
+  futwork for june 2026")` correctly returned `company: "futwork"` in its
+  result with no company argument passed in at all.
+
+### [29] app/rag/vector_utils.py
+- Motive: Moving the RAG bookkeeping tables off Neon to a local SQLite
+  file (at explicit user request) meant losing pgvector — SQLite has no
+  native vector column type or `<=>` distance operator — so something has
+  to stand in for both halves of what pgvector did: storing an embedding
+  in a column, and ranking rows by similarity to a query vector.
+- Logic: `VectorJSON` is a SQLAlchemy `TypeDecorator` wrapping `Text` —
+  `process_bind_param()` JSON-encodes a `list[float]` into a string before
+  it's written, `process_result_value()` JSON-decodes it back into a
+  `list[float]` on read. From the ORM model's point of view it behaves
+  like any other typed column; only `schema_store.py`/`example_store.py`
+  need to know it's backed by JSON text under the hood. `cosine_similarity
+  (a, b)` is plain-Python cosine similarity (dot product over the product
+  of norms, guarding against a zero-norm vector by returning `0.0` rather
+  than dividing by zero) — no new dependency (no numpy), since the data
+  size here (177 rows for one company) makes pure-Python ranking fast
+  enough; would need revisiting if a company's schema knowledge grew by a
+  couple of orders of magnitude. Imported by `app/rag/schema_store.py` and
+  `app/rag/example_store.py` (Timeline `[10]`/`[11]`, Routes Graph nodes
+  6/7), which now rank candidates by calling this function in Python
+  instead of asking Postgres to order by `embedding <=> :vector`.
+  **Verified for real**: `search_schema()`/`search_examples()` against the
+  new SQLite store return the same top matches as the old pgvector-backed
+  Neon store did for the same queries — confirmed via a live `/query/
+  no-cache` request retrieving correct context and generating correct SQL.

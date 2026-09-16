@@ -1,12 +1,11 @@
 from sqlalchemy import String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from app.core.db import Base
+from app.core.db import RagBase
 
 
-class CompanyProfile(Base):
+class CompanyProfile(RagBase):
     __tablename__ = "company_profiles"
-    __table_args__ = {"schema": "rag"}
 
     company: Mapped[str] = mapped_column(String(64), primary_key=True)
     profile: Mapped[str] = mapped_column(Text)

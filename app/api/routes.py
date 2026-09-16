@@ -8,17 +8,15 @@ router = APIRouter()
 
 @router.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest) -> QueryResponse:
-    try:
-        result = run_query(request.company, request.question)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Unknown company: {request.company!r}")
+    result = run_query(request.question)
+    if result["company_detection_error"]:
+        raise HTTPException(status_code=404, detail=result["company_detection_error"])
     return QueryResponse(**result)
 
 
 @router.post("/query/no-cache", response_model=QueryResponse)
 def query_no_cache(request: QueryRequest) -> QueryResponse:
-    try:
-        result = run_query_no_cache(request.company, request.question)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Unknown company: {request.company!r}")
+    result = run_query_no_cache(request.question)
+    if result["company_detection_error"]:
+        raise HTTPException(status_code=404, detail=result["company_detection_error"])
     return QueryResponse(**result)

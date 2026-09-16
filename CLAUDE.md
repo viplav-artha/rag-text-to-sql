@@ -6,20 +6,26 @@ A production-intent RAG-based text-to-SQL system for financial data. A Neon Post
 `.env`) database holds a company's financial metrics matrix. Users ask natural-language
 financial questions (e.g. "what was YoY revenue growth last quarter?"); the system retrieves
 grounding context — relevant schema/column descriptions and similar few-shot NL→SQL example
-pairs — via pgvector similarity search inside that same Neon database, then uses a LangGraph
-workflow (retrieve → generate SQL → validate → execute → format) driven by an AWS Bedrock LLM
-to produce and run the SQL, returning the answer. Embeddings for RAG retrieval use a local,
-open-source model (`sentence-transformers/all-MiniLM-L6-v2`, 384-dim) — no AWS dependency for
-that part, only the chat LLM uses Bedrock. Redis caches LLM output and SQL results to cut
-latency/cost on repeated or similar questions. The whole thing is exposed as a FastAPI service.
+pairs — from a local SQLite store (`rag_store.db`, created automatically at server startup;
+see below), then uses a LangGraph workflow (detect company → retrieve → generate SQL →
+validate → execute → format) driven by an AWS Bedrock LLM to produce and run the SQL,
+returning the answer. Embeddings for RAG retrieval use a local, open-source model
+(`sentence-transformers/all-MiniLM-L6-v2`, 384-dim) — no AWS dependency for that part, only
+the chat LLM uses Bedrock. Redis caches LLM output and SQL results to cut latency/cost on
+repeated or similar questions. The whole thing is exposed as a FastAPI service.
 Tech stack: Python, LangChain, LangGraph, langchain-aws (Bedrock chat LLM), sentence-transformers
-(local embeddings), FastAPI, SQLAlchemy, Neon Postgres + pgvector, Redis, LangSmith (evals).
+(local embeddings), FastAPI, SQLAlchemy, Neon Postgres (real financial data only), SQLite
+(RAG bookkeeping), Redis, LangSmith (evals).
 
-**Multi-tenant from the start:** every RAG knowledge row (`rag.schema_chunks`, `rag.few_shot_examples`,
-`rag.company_profiles` — all three live in a dedicated `rag` Postgres schema, not `public`) is
-scoped by an explicit `company` field, and retrieval always filters by it before doing similarity
-search. Only one company exists today — **Futwork** (a telecalling/
-voice-BPO platform; see its stored profile in `rag.company_profiles`), whose real data lives in
+**Multi-tenant from the start:** every RAG knowledge row (`schema_chunks`, `few_shot_examples`,
+`company_profiles` — all three live in the local SQLite file, not Neon; originally lived in a
+dedicated `rag` Postgres schema on Neon, moved off it entirely at explicit user request — see
+Known gaps) is scoped by an explicit `company` field, and retrieval always filters by it before
+doing similarity search (now computed in Python via cosine similarity, not pgvector, since
+SQLite has no vector column type). The caller doesn't even supply `company` anymore — the
+pipeline detects it from the question text itself (`detect_company_node`, see the build-order
+notes below). Only one company exists today — **Futwork** (a telecalling/voice-BPO platform;
+see its stored profile in `company_profiles`), whose real data lives in
 `portfolio.futwork_vs_aop` in Neon — but the schema is built so a second company's data can be
 added later (a similarly-shaped view joining that company's MIS/AOP tables) without one
 company's questions ever retrieving another's context.
@@ -87,6 +93,75 @@ a new `run_query_no_cache()` in `query_service.py`, reusing the same
 two identical requests both took full pipeline latency (no speedup on the
 second call, unlike `/query`'s ~0.065s cache-hit case), and a direct
 Redis check confirmed no cache entry was ever written for that question.
+
+Second post-build addition: reworked how the pipeline picks which database
+table to query for a company. Previously `nodes.py` computed one hardcoded
+`allowed_table` string per company and dictated it to the LLM; now each
+company's data module (`data/companies/futwork.py`) exposes a `TABLES`
+list (`{schema, table, description}` per table), `generate_sql_node` shows
+the LLM the whole list and lets the LLM pick the matching one, and
+`validate_sql_node` accepts SQL against any entry in that list instead of
+one fixed string — see Known gaps for the full before/after and what's
+still hardcoded (which companies exist at all, via `_COMPANY_DATA` in
+`nodes.py`). Verified for real via `POST /query/no-cache` against live
+Bedrock + Neon: the LLM, shown the new `TABLES` list, correctly picked
+`portfolio.futwork_vs_aop` itself and produced valid, correct SQL on the
+first try.
+
+Third post-build addition: `company` is no longer a request field at all —
+the pipeline now auto-detects it from the question text itself. A new
+`detect_company_node` (in `nodes.py`) runs first in the graph, shows the
+LLM every known company (name + one-line business summary, via a new
+`_format_known_companies()` helper reading the same `_COMPANY_DATA`
+registry), and asks it to pick which one the question is about (or
+`UNKNOWN`). A match sets `company` in graph state and the pipeline
+proceeds exactly as before; no match sets `company_detection_error` and
+`graph.py`'s new conditional edge routes straight to `END`, so
+`retrieve_node`/`generate_sql_node`/etc. never run for a request the
+pipeline can't confidently attribute to a known company. `QueryRequest`
+now only has `question`; `QueryResponse` gained `company` and
+`company_detection_error`; `run_query()`/`run_query_no_cache()` dropped
+their `company` parameter (cache key is now `question`-only); `routes.py`
+checks `company_detection_error` and raises the same `404` as before,
+replacing the old `except KeyError` (which is no longer reachable — see
+Known gaps). Verified for real against live Bedrock + Neon: `{"question":
+"tell me the revenue of the futwork for june 2026"}` (no `company` field)
+correctly detected `futwork` and returned the right answer; a question
+naming an unrecognized company correctly returned a `404` instead of a
+guess or a crash.
+
+Fourth post-build addition: the three RAG bookkeeping tables
+(`schema_chunks`, `few_shot_examples`, `company_profiles`) moved off Neon
+entirely, at explicit user request — they now live in a local SQLite file
+(`rag_store.db`), created automatically the first time the server starts
+(`app/main.py`'s `lifespan` hook now runs `RagBase.metadata.
+create_all(rag_engine)` instead of `init_pgvector_extension()` +
+`Base.metadata.create_all(engine)`, both deleted). Neon's only remaining
+job is the real financial data table (`portfolio.futwork_vs_aop`),
+queried directly with raw SQL — it no longer has any ORM models
+registered on it at all. `app/core/db.py` now manages two databases:
+the existing Neon `engine`/`SessionLocal`/`Base`/`db_session()`
+(unchanged), plus new SQLite `rag_engine`/`RagSessionLocal`/`RagBase`/
+`rag_db_session()`. Since SQLite has no pgvector, `SchemaChunk`/
+`FewShotExample`'s `embedding` column changed from `Vector(384)` to a new
+`VectorJSON` type (`app/rag/vector_utils.py` — a `TypeDecorator` that
+JSON-encodes/decodes a `list[float]`), and `search_schema()`/
+`search_examples()` now rank candidates by a plain-Python
+`cosine_similarity()` instead of a pgvector `ORDER BY` clause — fine at
+this data size (177 rows), see Known gaps for the scaling caveat.
+`scripts/ingest_knowledge.py` now writes via `rag_db_session()` and calls
+`RagBase.metadata.create_all(rag_engine)` itself, so it works standalone
+even before the server has ever been started. `RAG_DATABASE_URL`
+(optional, defaults to `sqlite:///./rag_store.db`) is the new setting;
+`pgvector` was removed from `requirements.txt` and `*.db`/`*.sqlite3`
+added to `.gitignore`. Verified for real: deleted `rag_store.db`, started
+the server with no file present — it created the file and all three
+tables itself — then ran `ingest_knowledge.py` (177 chunks + 5 examples,
+matching the old Neon-era counts exactly) and confirmed a live
+`/query/no-cache` request still retrieved correct context and answered
+correctly. The old Neon `rag` schema tables were left in place, now
+orphaned/unused — not dropped automatically (a destructive Neon change
+wasn't part of this ask); worth cleaning up manually if desired.
 `DATABASE_URL` and `REDIS_URL` are both set in `.env`.
 
 ## Planned build order
@@ -143,7 +218,12 @@ package markers are omitted from both (see the Maintenance instructions below).
    lesson 5 once embeddings moved off Bedrock to a local model)
 7. `app/core/db.py` — SQLAlchemy engine/session (psycopg v3 driver), `Base` for
    ORM models, `get_db()` (FastAPI dependency), `db_session()` (context manager),
-   `init_pgvector_extension()`
+   `init_pgvector_extension()`. **Corrected post-hoc**: `init_pgvector_extension()`
+   deleted (nothing uses pgvector anymore); added a second, independent
+   SQLite engine/session (`rag_engine`, `RagSessionLocal`, `RagBase`,
+   `rag_db_session()`) for the RAG bookkeeping tables — see lesson 10's note.
+   `engine`/`SessionLocal`/`Base`/`db_session()` (Neon) are otherwise
+   unchanged and now used only for the real financial data table.
 8. `app/core/cache.py` — Redis client singleton, `make_cache_key()`,
    `cache_get()`/`cache_set()` (JSON-encoded, TTL-backed)
 9. `app/rag/embeddings.py` — `get_embeddings()`, cached `HuggingFaceEmbeddings`
@@ -155,11 +235,18 @@ package markers are omitted from both (see the Maintenance instructions below).
     company and which Postgres schema (`portfolio`, not `public` — this is a
     separate concept from the `rag` schema the table itself lives in, see
     above) they describe, and `search_schema()` filters by `company` before
-    similarity ordering.
+    similarity ordering. **Corrected post-hoc, moved off Neon entirely**:
+    now subclasses `RagBase` (SQLite) instead of `Base` (Neon), dropped
+    `__table_args__` (no Postgres schema concept in SQLite), `embedding`
+    changed from `Vector(384)` to the new `VectorJSON` type, and
+    `search_schema()` ranks in Python via `cosine_similarity()` instead of
+    a pgvector `ORDER BY` clause.
 11. `app/rag/example_store.py` — `FewShotExample` ORM model (embeds `question`
     only, also in the `rag` schema), `add_example()`, `search_examples()`
     (top_k=3 by default). **Corrected post-hoc**: added `company` field/param,
-    filtered the same way.
+    filtered the same way. **Corrected post-hoc, moved off Neon entirely**:
+    same treatment as `schema_store.py` above — `RagBase`, no
+    `__table_args__`, `VectorJSON`, Python-side `cosine_similarity()` ranking.
 12. `app/rag/retriever.py` — `RetrievedContext` dataclass (+ `to_prompt_text()`),
     `retrieve_context()` combining schema + example search into one call.
     **Corrected post-hoc**: takes `company`, also fetches the company's business
@@ -168,20 +255,58 @@ package markers are omitted from both (see the Maintenance instructions below).
 13. `app/rag/company_profile.py` — `CompanyProfile` ORM model (`company` primary
     key, `profile` text, no embedding column — fetched by exact company match,
     not similarity search, also in the `rag` schema), `get_company_profile()`,
-    `upsert_company_profile()`
+    `upsert_company_profile()`. **Corrected post-hoc, moved off Neon
+    entirely**: now subclasses `RagBase` instead of `Base`, dropped
+    `__table_args__` — no embedding column to begin with, so no
+    `VectorJSON` change needed here.
 14. `data/companies/futwork.py` — Futwork's knowledge data: `PROFILE`,
     `EXCLUDED_COLUMNS`, `PER_CLIENT_TEMPLATES` (2), `METRIC_DESCRIPTIONS` (67),
-    `FEW_SHOT_EXAMPLES` (5) — pure data, no logic
+    `FEW_SHOT_EXAMPLES` (5) — pure data, no logic. **Corrected post-hoc**:
+    added `TABLES` (list of `{schema, table, description}` dicts, one entry
+    today) — the query-time table registry `nodes.py` shows the LLM so it
+    can pick the table itself; `SCHEMA_NAME`/`TABLE_NAME` are unchanged and
+    still drive `ingest_knowledge.py`'s column introspection.
 15. `scripts/ingest_knowledge.py` — introspects `portfolio.futwork_vs_aop`'s
     real columns, matches each against `futwork.py`'s data (per-client pattern
     or exact metric), and idempotently (re)populates all three RAG tables for
-    company `futwork`
+    company `futwork`. **Corrected post-hoc, moved off Neon entirely**:
+    writes now go through `rag_db_session()` (SQLite) instead of
+    `db_session()` (Neon); `engine` (Neon) is still used, only for
+    `inspect(engine)`'s column introspection. Also now calls
+    `RagBase.metadata.create_all(rag_engine)` itself at the start of
+    `ingest()`, so it can run standalone on a machine that's never started
+    the server (and therefore never had `rag_store.db` created yet).
 16. `app/graph/state.py` — `GraphState` TypedDict, the shared object every
-    LangGraph node reads/writes; only `company`/`question` are required,
-    every other field is `NotRequired` and filled in as the graph runs
+    LangGraph node reads/writes; only `question` is required, every other
+    field is `NotRequired` and filled in as the graph runs.
+    **Corrected post-hoc**: `company` moved from required to `NotRequired`
+    and a new `company_detection_error` field was added — see lesson 17's
+    note.
 17. `app/graph/nodes.py` — `retrieve_node()`, `generate_sql_node()`,
     `validate_sql_node()` — the retrieve/generate/validate stages of the
-    pipeline, verified end-to-end against real Bedrock + Neon
+    pipeline, verified end-to-end against real Bedrock + Neon.
+    **Corrected post-hoc**: table selection redesigned so the LLM decides
+    which table to query, instead of Python resolving one hardcoded
+    `allowed_table` string. `generate_sql_node` now shows the LLM the
+    company's whole `TABLES` list (via `_format_allowed_tables()`) and asks
+    it to pick the matching one; `validate_sql_node` now accepts SQL that
+    references *any* table in that list (via `_table_in_sql()`), not just
+    one fixed string. `_COMPANY_DATA`/`_get_company_data()` — which company
+    names exist at all — is unchanged.
+    **Corrected post-hoc, company auto-detection**: added
+    `detect_company_node()` — the pipeline's new first stage. Shows the LLM
+    every known company (via a new `_format_known_companies()` helper) and
+    asks it to pick the one the question is about, or reply `UNKNOWN`. Sets
+    `company` in state on a match, `company_detection_error` otherwise —
+    never both. `retrieve_node`/`generate_sql_node`/`validate_sql_node` are
+    unchanged; they simply never run when detection fails (enforced by
+    `graph.py`'s new conditional edge, see lesson 19). Verified for real:
+    "tell me the revenue of the futwork for june 2026" (no `company` field
+    anywhere in the request) correctly detected `futwork`.
+    **Corrected post-hoc, RAG store moved off Neon entirely**:
+    `retrieve_node()` now opens a `rag_db_session()` instead of a
+    `db_session()` — `retrieve_context()`'s reads come from the new SQLite
+    store, not Neon. Nothing else in this file changed for this move.
 18. `app/graph/execute_node.py` — `execute_sql_node()` (statement timeout,
     automatic row limit, Decimal/date serialization, defense-in-depth
     validation guard), `format_answer_node()` (LLM narrates results into
@@ -189,7 +314,16 @@ package markers are omitted from both (see the Maintenance instructions below).
 19. `app/graph/graph.py` — `build_graph()` assembles all 5 nodes into a
     compiled `StateGraph`, `_route_after_validation()` conditional edge
     (retry generate on validation failure, capped at `_MAX_RETRIES = 2`),
-    module-level `graph` ready for `.invoke()`
+    module-level `graph` ready for `.invoke()`.
+    **Corrected post-hoc, company auto-detection**: added a 6th node,
+    `detect_company`, as the new entry point (`START → detect_company`),
+    plus `_route_after_detect_company()` — a conditional edge that ends the
+    graph immediately if `company_detection_error` is set, otherwise
+    proceeds into the unchanged `retrieve → generate → validate → ... →
+    format → END` chain. Verified for real: a request with no company field
+    correctly ran the whole pipeline after auto-detecting `futwork`; a
+    request naming an unrecognized company correctly stopped right after
+    `detect_company` with no wasted retrieval/generation work.
 20. `app/main.py` — started at lesson 12 as an early minimal test harness
     (built ahead of build order, at the user's explicit request, calling
     `graph.invoke()` directly), then incrementally completed in place
@@ -203,6 +337,12 @@ package markers are omitted from both (see the Maintenance instructions below).
     the real, finished file** — verified for real: clean restart, row
     counts in all three RAG tables unchanged after restart (confirming
     `create_all()` never touches existing data), `/query` still correct.
+    **Corrected post-hoc, RAG store moved off Neon entirely**: the
+    lifespan hook now runs `RagBase.metadata.create_all(rag_engine)`
+    instead of `init_pgvector_extension()` + `Base.metadata.create_all
+    (engine)` — both deleted from `db.py`. Verified for real: deleted
+    `rag_store.db`, started the server with no file present at all — it
+    created the file and all three tables automatically on first boot.
 21. `evals/__init__.py` — empty package marker for the `evals` package
 22. `evals/create_financial_qa_dataset.py` — idempotent script that syncs the
     `financial-qa-eval-futwork` LangSmith dataset (7 question/expected_sql/
@@ -236,6 +376,11 @@ package markers are omitted from both (see the Maintenance instructions below).
     — same shape, reuses `_extract_result()`, but skips every cache step
     entirely (no `cache_get`/`cache_set` at all), for the `/query/no-cache`
     endpoint below.
+    **Corrected post-hoc, company auto-detection**: both functions dropped
+    `company` — now `run_query(question)`/`run_query_no_cache(question)`.
+    `_extract_result()` also returns `company`/`company_detection_error`;
+    `_is_cacheable()` now also requires `company_detection_error is None`
+    before caching. Cache key is now `question`-only.
 28. `app/api/__init__.py` — empty package marker for the `app.api` package
 29. `app/api/schemas.py` — `QueryRequest` (`company`/`question`, required,
     whitespace-stripped, rejected if blank, `question` capped at 500 chars
@@ -243,6 +388,10 @@ package markers are omitted from both (see the Maintenance instructions below).
     replaces the inline models that used to live in `app/main.py`. Verified
     live over HTTP: a blank question returns a clean `422`, a valid one
     still returns `200` with the correct answer.
+    **Corrected post-hoc, company auto-detection**: `QueryRequest` dropped
+    `company` — a request is now just `{"question": "..."}`.
+    `QueryResponse` gained `company`/`company_detection_error`, both
+    optional.
 30. `app/api/routes.py` — `APIRouter` with the `POST /query` endpoint;
     wraps `run_query()` in `try`/`except KeyError` to turn an unknown
     company into a clean `404` instead of an unhandled `500`. `app/main.py`
@@ -255,6 +404,23 @@ package markers are omitted from both (see the Maintenance instructions below).
     (no cache-hit speedup), and a direct Redis check confirmed no cache
     entry was ever written; unknown-company `404` handling confirmed on
     this endpoint too.
+    **Corrected post-hoc, company auto-detection**: both handlers dropped
+    `request.company` (calling `run_query(request.question)`/
+    `run_query_no_cache(request.question)` instead) and the `try`/`except
+    KeyError` wrapper is gone — replaced with a check on
+    `result["company_detection_error"]`, raising the same `404` as before
+    when set. Verified live: `{"question": "tell me the revenue of the
+    futwork for june 2026"}` (no `company` field) returned `200` with
+    `company: "futwork"` correctly detected; a question naming an
+    unrecognized company returned a clean `404` with the detection-failure
+    message.
+31. `app/rag/vector_utils.py` — added post-build, when the RAG store moved
+    off Neon/pgvector to a local SQLite file: `VectorJSON` (a
+    `TypeDecorator` that JSON-encodes/decodes a `list[float]` embedding
+    into a `Text` column, standing in for pgvector's `Vector(384)`) and
+    `cosine_similarity()` (plain-Python dot-product/norm math, no numpy).
+    Used by `schema_store.py`/`example_store.py` to rank candidates in
+    Python instead of asking Postgres to order by `embedding <=> :vector`.
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,
@@ -267,12 +433,15 @@ imports the three RAG store modules for table registration —
 - Activate venv: `source .venv/bin/activate`
 - Install deps: `pip install -r requirements.txt`
 - Run: `uvicorn app.main:app --reload` — the real, finished app as of
-  lesson 18, plus one post-build addition: two endpoints, both taking
-  `{"company": "futwork", "question": "..."}` — `POST /query` (Redis-cached
-  via `query_service.py`) and `POST /query/no-cache` (always hits the real
-  pipeline/database, never touches Redis) — validated via `api/schemas.py`,
-  routed via `api/routes.py`, with a `lifespan` startup hook that bootstraps the
-  pgvector extension and RAG tables automatically
+  lesson 18, plus post-build additions: two endpoints, both taking just
+  `{"question": "..."}` (no `company` field — the pipeline detects which
+  company the question is about itself, via `detect_company_node`) —
+  `POST /query` (Redis-cached via `query_service.py`) and
+  `POST /query/no-cache` (always hits the real pipeline/database, never
+  touches Redis) — validated via `api/schemas.py`, routed via
+  `api/routes.py`, with a `lifespan` startup hook that creates the local
+  SQLite RAG store (`rag_store.db`) automatically on first boot — no
+  pgvector/Neon bootstrap needed anymore for these tables
 - External services required, credentials supplied via `.env`:
   - AWS Bedrock (chat LLM only — embeddings are local, see lesson 5) —
     `BEDROCK_CHAT_MODEL_ID`, `BEDROCK_REGION`/`AWS_REGION`, `AWS_PROFILE`,
@@ -286,11 +455,20 @@ imports the three RAG store modules for table registration —
     worked; if credentials/permissions ever need rotating, re-verify with
     `aws sts get-caller-identity --profile Artha-stg-dev` first.
   - Neon Postgres (`RAG` branch specifically, not `dev`/`production` —
-    `NEON_BRANCH=RAG` in `.env`; pgvector extension enabled) — `DATABASE_URL`.
-    Paste Neon's connection string as-is (`postgresql://...` or `postgres://...`);
-    `app/core/db.py` rewrites it to `postgresql+psycopg://` automatically since
-    the project uses the psycopg (v3) driver, not psycopg2. **Set in `.env` as of
-    lesson 6.**
+    `NEON_BRANCH=RAG` in `.env`) — `DATABASE_URL`. Paste Neon's connection
+    string as-is (`postgresql://...` or `postgres://...`); `app/core/db.py`
+    rewrites it to `postgresql+psycopg://` automatically since the project
+    uses the psycopg (v3) driver, not psycopg2. **Set in `.env` as of
+    lesson 6.** Holds only the real financial data table
+    (`portfolio.futwork_vs_aop`) now — pgvector is no longer used, and the
+    three RAG bookkeeping tables moved to local SQLite (see below).
+  - Local SQLite (RAG bookkeeping tables: `schema_chunks`,
+    `few_shot_examples`, `company_profiles`) — `RAG_DATABASE_URL`,
+    **optional**, defaults to `sqlite:///./rag_store.db`. No credentials,
+    no server — the file is created automatically the first time the
+    server starts (`app/main.py`'s `lifespan` hook), and by
+    `scripts/ingest_knowledge.py` if run before the server ever has been.
+    Not committed — covered by `.gitignore` (`*.db`).
   - Redis (caching) — `REDIS_URL`. **Set in `.env`** as of lesson 6, pointing at
     a local Redis running in Docker (`docker run -d --name rag-redis -p
     6379:6379 redis:alpine`). Restart that container (`docker start rag-redis`)
@@ -415,19 +593,109 @@ imports the three RAG store modules for table registration —
   answer in practice (the near-identical few-shot example carried the LLM
   through), so left as a monitored gap rather than chased further — revisit
   if it ever causes an actual wrong-SQL generation.
-- **[Fixed, lesson 17]** `app/api/schemas.py`'s `QueryRequest` validates
-  shape only (non-empty, length-capped), not whether `company` is one the
-  pipeline actually knows about — an unrecognized company reaches
-  `nodes.py`'s `_get_company_data()`, which raises a plain `KeyError`.
-  `app/api/routes.py` now catches that specific exception and returns a
-  clean `404 Unknown company: '...'` instead of an unhandled `500`.
-  **Still an open, smaller gap**: catching bare `KeyError` is a little
-  broad — some unrelated bug could theoretically also raise a `KeyError`
-  in this call path and get misreported as "unknown company." A more
-  precise fix would expose a dedicated `is_known_company()` check from
-  `nodes.py`'s `_COMPANY_DATA` registry and validate *before* calling the
-  graph at all. Not urgent since there's currently no other source of
-  `KeyError` in this path, but worth doing if/when that stops being true.
+- **[Fixed, lesson 17 — later superseded, see below]** `app/api/schemas.py`'s
+  `QueryRequest` validated shape only (non-empty, length-capped), not
+  whether `company` is one the pipeline actually knows about — an
+  unrecognized company reached `nodes.py`'s `_get_company_data()`, which
+  raised a plain `KeyError`. `app/api/routes.py` caught that specific
+  exception and returned a clean `404 Unknown company: '...'` instead of an
+  unhandled `500`. The previously-noted follow-up gap (catching bare
+  `KeyError` is a little broad) is now moot: the company-auto-detection
+  redesign below removed `company` from the request entirely, and with it
+  the `try`/`except KeyError` — there's no longer a caller-supplied
+  `company` value that could be wrong in this call path at all.
+- **[Redesigned]** Table selection is now LLM-driven, not hardcoded in
+  Python. Previously `generate_sql_node`/`validate_sql_node` computed one
+  `allowed_table` string from `company_data.SCHEMA_NAME`/`TABLE_NAME` and
+  either dictated it to the LLM or rejected SQL that didn't reference it —
+  meaning Python decided the table, and the design silently assumed exactly
+  one table per company. Now `data/companies/futwork.py` exposes `TABLES`
+  (a list of `{schema, table, description}` dicts), `generate_sql_node`
+  shows the LLM that whole list and asks it to pick the one that matches
+  the question, and `validate_sql_node` accepts SQL referencing *any*
+  entry in the list. This means a company with multiple tables just needs
+  more `TABLES` entries — no code change. **What's still hardcoded**: which
+  *companies* exist at all is still the `_COMPANY_DATA = {"futwork":
+  futwork}` dict in `nodes.py` — adding a second company still means adding
+  a line to that dict (and a new `data/companies/<company>.py` module with
+  its own `TABLES`). That's the same normalization gap noted above (`company`
+  as a plain string, not a proper registry/FK) — not fixed by this change,
+  just no longer conflated with table selection. Verified locally first
+  (`_get_company_data()`, `_format_allowed_tables()`, and `_table_in_sql()`
+  all behave correctly in isolation — correct SQL matches, SQL against an
+  unrelated table doesn't, unknown company still raises `KeyError`), then
+  **verified for real** end-to-end via `POST /query/no-cache` against live
+  Bedrock + Neon: "What was the total revenue in March 2026?" → the LLM,
+  shown the new `TABLES` list instead of one dictated table string, picked
+  `portfolio.futwork_vs_aop` itself and generated valid SQL against it on
+  the first try (`validation_error: null`, no retry needed), with the
+  correct answer ("INR 22,063,632").
+- **[Redesigned]** `company` is no longer a request field — the pipeline
+  detects it from `question` itself, via a new `detect_company_node`
+  (first stage of the graph) that shows the LLM every entry in
+  `_COMPANY_DATA` (name + a one-line business summary) and asks it to pick
+  the matching one, or reply `UNKNOWN`. This means every `/query` request
+  now costs **two** LLM calls on a cache miss instead of one (detect, then
+  generate) — a real latency/cost tradeoff for the convenience of not
+  having to pass `company` explicitly; worth watching if per-request cost
+  ever matters. **What's still hardcoded**: exactly the same thing as the
+  table-selection redesign above — which companies exist at all is still
+  `_COMPANY_DATA` in `nodes.py`, and `detect_company_node`'s prompt is only
+  as good as each company's `PROFILE`'s first sentence (used as the
+  one-line summary shown to the LLM) at distinguishing it from every other
+  company; this hasn't been stress-tested with more than one real company
+  yet. **Also open**: a question that's ambiguous or names no company at
+  all correctly falls back to `UNKNOWN`/`404` rather than guessing — this
+  is deliberate (wrong-company silent misrouting would be worse than a
+  clear rejection) but means a genuinely company-agnostic question (if one
+  ever makes sense in this system) has no path to succeed today. Verified
+  for real against live Bedrock + Neon: correct detection from a question
+  naming the company in passing ("tell me the revenue of the futwork for
+  june 2026"), and a clean `404` for a question naming an unrecognized
+  company.
+- **[Redesigned]** The three RAG bookkeeping tables (`schema_chunks`,
+  `few_shot_examples`, `company_profiles`) moved off Neon/pgvector to a
+  local SQLite file (`rag_store.db`), at explicit user request. Real
+  tradeoffs worth tracking, not just upsides: (1) **not backed up or
+  shared** — it's a plain file on whichever machine runs the app; a fresh
+  clone or a new container has to re-run `scripts/ingest_knowledge.py`
+  from scratch (fine today since that script is idempotent and fast, but
+  worth remembering if this ever runs somewhere ephemeral/stateless, like
+  a container that gets rebuilt often — the RAG knowledge would vanish
+  with it unless the file is persisted separately); (2) **similarity
+  search is now O(n) pure-Python** (fetch every candidate row for a
+  company, rank by `cosine_similarity()` in-process) instead of an
+  indexed pgvector `ORDER BY` — completely fine at 177 rows for one
+  company, would need revisiting (a real vector index, or moving back to
+  a vector-capable store) if that grew by a couple of orders of magnitude;
+  (3) **SQLite's single-writer model** — fine for this app's actual write
+  pattern (occasional re-ingestion, not concurrent request-time writes),
+  but worth remembering if that ever changes; (4) the **old Neon `rag`
+  schema tables were left in place**, now orphaned/unused — not dropped
+  automatically, since that's a destructive Neon change outside the scope
+  of what was asked; worth cleaning up manually if desired. Verified for
+  real: deleted `rag_store.db`, started the server with no file
+  present — it created the file and all three tables itself — then ran
+  `ingest_knowledge.py` (177 chunks + 5 examples, matching the old
+  Neon-era counts exactly) and confirmed a live `/query/no-cache` request
+  still retrieved correct context and answered correctly.
+  **Hit for real, not just theoretical**: in a later session, `rag_store.db`
+  existed but was empty (0 rows) — the server booted fine (`create_all()`
+  doesn't care if a table is empty) and `/query` returned `200`, but with
+  `sql_result: null` and a real execution error: the LLM, given zero
+  retrieved schema context, guessed a plausible-sounding but nonexistent
+  column name (`revenue` instead of the real `total_revenue`) and Postgres
+  rejected it (`UndefinedColumn`). This is exactly tradeoff (1) above,
+  observed in practice rather than just predicted: unlike the old Neon
+  setup, nothing here persists the ingested knowledge anywhere shared, so
+  every fresh environment (new session, new clone, a deleted/reset file)
+  silently starts with an empty RAG store until `python -m scripts.
+  ingest_knowledge` is run again — there's no error at server-start time
+  to flag it, only a downgraded, retrieval-less answer at query time. Fixed
+  by re-running the ingestion script; re-verified the same question then
+  correctly generated `SELECT total_revenue FROM portfolio.futwork_vs_aop
+  ...` and returned the right number. Worth checking row counts first
+  whenever a query returns a suspiciously generic/wrong-looking SQL.
 
 ## Companion file
 See `NOTES.md` for the plain-language, no-analogy study notes, the file-creation

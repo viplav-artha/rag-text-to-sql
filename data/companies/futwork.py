@@ -2,6 +2,25 @@ COMPANY = "futwork"
 SCHEMA_NAME = "portfolio"
 TABLE_NAME = "futwork_vs_aop"
 
+# Tables the LLM is allowed to query for this company. `ingest_knowledge.py`
+# still uses the single SCHEMA_NAME/TABLE_NAME pair above for column
+# introspection — this list is the query-time registry: generate_sql_node
+# shows it to the LLM so the LLM itself picks the right table (today there's
+# only one, but a second table just means appending an entry here), and
+# validate_sql_node checks generated SQL against every entry in this list
+# instead of one hardcoded string.
+TABLES = [
+    {
+        "schema": SCHEMA_NAME,
+        "table": TABLE_NAME,
+        "description": (
+            "Futwork's monthly financial metrics matrix — actuals and AOP "
+            "targets, per-client billing/minutes, headcount, AR aging, cash "
+            "and runway."
+        ),
+    },
+]
+
 PROFILE = (
     "Futwork is a telecalling/voice-BPO platform that recruits and deploys a "
     "distributed gig workforce (largely home-based agents) to make outbound "

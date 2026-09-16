@@ -2,7 +2,7 @@ import re
 
 from sqlalchemy import delete, inspect
 
-from app.core.db import db_session, engine
+from app.core.db import RagBase, engine, rag_db_session, rag_engine
 from app.rag.company_profile import upsert_company_profile
 from app.rag.example_store import FewShotExample, add_example
 from app.rag.schema_store import SchemaChunk, add_schema_chunk
@@ -27,13 +27,15 @@ def _describe_column(column_name: str) -> tuple[str, bool] | None:
 
 
 def ingest() -> None:
+    RagBase.metadata.create_all(rag_engine)
+
     inspector = inspect(engine)
     columns = inspector.get_columns(company_data.TABLE_NAME, schema=company_data.SCHEMA_NAME)
 
     inserted = 0
     skipped: list[str] = []
 
-    with db_session() as db:
+    with rag_db_session() as db:
         db.execute(delete(SchemaChunk).where(SchemaChunk.company == company_data.COMPANY))
         db.execute(delete(FewShotExample).where(FewShotExample.company == company_data.COMPANY))
 
