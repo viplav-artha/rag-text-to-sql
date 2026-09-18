@@ -185,6 +185,15 @@ startup, and a live `/query` request for "what was the total revenue for
 futwork in june 2026" returned the correct SQL and answer with zero Redis
 involvement; confirmed `/query/no-cache` now correctly 404s (route no
 longer exists).
+Sixth post-build addition: `ARCHITECTURE.md`, at the user's request, reviewing
+a hand-drawn architecture diagram they made and adding what it was missing —
+most notably the entire `detect_company_node` stage (their diagram started at
+`retrieve_node`), the conditional (not unconditional) retry loop, all three
+external systems (Bedrock/Neon/SQLite), the offline ingestion pipeline that
+populates the SQLite RAG store, the HTTP layer, and an explicit note that
+there's deliberately no caching. Contains a corrected Mermaid flowchart of the
+full request path plus the separate offline ingestion path.
+
 `DATABASE_URL` is set in `.env`.
 
 ## Planned build order
@@ -467,6 +476,15 @@ package markers are omitted from both (see the Maintenance instructions below).
     `cosine_similarity()` (plain-Python dot-product/norm math, no numpy).
     Used by `schema_store.py`/`example_store.py` to rank candidates in
     Python instead of asking Postgres to order by `embedding <=> :vector`.
+32. `ARCHITECTURE.md` — added post-build, at explicit user request: reviews
+    a hand-drawn architecture diagram the user made, identifies what it's
+    missing (the `detect_company_node` stage entirely, the conditional
+    retry-vs-proceed logic, all three external systems — Bedrock/Neon/
+    SQLite — the two-pool retrieval + table-selection nuance inside
+    `retrieve_node`/`generate_sql_node`, the offline ingestion pipeline,
+    the HTTP layer, and the deliberate absence of caching), and provides a
+    corrected Mermaid flowchart covering the full request path plus the
+    separate offline ingestion path.
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,

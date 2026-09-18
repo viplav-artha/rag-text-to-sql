@@ -100,6 +100,11 @@ study and are omitted here). Each node is numbered by creation order.
      v
 [29] app/rag/vector_utils.py (post-build, added when the RAG store moved
      off Neon/pgvector to a local SQLite file — see its own note)
+     |
+     v
+[32] ARCHITECTURE.md (post-build, docs-only — reviews a hand-drawn diagram
+     and adds a corrected Mermaid architecture diagram; no code, so no
+     Routes Graph node)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -1220,3 +1225,25 @@ chat and in CLAUDE.md, not here).
   new SQLite store return the same top matches as the old pgvector-backed
   Neon store did for the same queries — confirmed via a live `/query/
   no-cache` request retrieving correct context and generating correct SQL.
+
+### [32] ARCHITECTURE.md
+- Motive: The user hand-drew an architecture diagram from their own
+  understanding of the pipeline and wanted it checked against the real
+  code — a docs-only deliverable, not a code file, so it gets a Timeline
+  entry but no Routes Graph node (nothing to import).
+- Logic: N/A (documentation, not code). Reviews the hand-drawn diagram
+  against the real graph in `app/graph/graph.py`/`nodes.py`/
+  `execute_node.py` and flags what it omitted: the entire
+  `detect_company_node` stage (the diagram started at `retrieve_node`);
+  the retry loop being conditional (`validation_error` set AND
+  `retry_count < 2`), not an unconditional loop-back; all three external
+  systems the pipeline actually talks to (AWS Bedrock for three separate
+  LLM calls, the local SQLite `rag_store.db` for retrieval, Neon Postgres
+  for real SQL execution); the two-pool similarity search plus business
+  profile fetch inside `retrieve_node`; the LLM-driven table selection
+  inside `generate_sql_node`; the offline `scripts/ingest_knowledge.py`
+  pipeline that populates the SQLite store (never part of a live
+  request); the FastAPI HTTP layer; and the deliberate absence of a
+  caching layer. Contains one corrected Mermaid `flowchart TD` covering
+  the full request path (client → FastAPI → LangGraph → external systems
+  → response) plus a separate subgraph for the offline ingestion path.
