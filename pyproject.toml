@@ -1,0 +1,28 @@
+[project]
+name = "rag-text-to-sql"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv",
+    "langchain-aws",
+    "langchain-huggingface",
+    "sentence-transformers",
+    "langgraph",
+    "sqlalchemy",
+    "psycopg[binary]",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = [
+    "app",
+    "app.core",
+    "app.rag",
+    "app.graph",
+    "app.services",
+    "data",
+    "data.companies",
+]
