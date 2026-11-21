@@ -194,6 +194,16 @@ populates the SQLite RAG store, the HTTP layer, and an explicit note that
 there's deliberately no caching. Contains a corrected Mermaid flowchart of the
 full request path plus the separate offline ingestion path.
 
+Seventh post-build addition: static API key auth for `/query`. New
+`app/core/auth.py` (`require_api_key`, reads the `X-API-Key` header, compares
+with `secrets.compare_digest`, 401 on mismatch); `config.py`'s `Settings` gained
+`api_key` (required `API_KEY` env var, `ValueError` if unset — the server
+refuses to start unprotected); `app/api/routes.py`'s router now has
+`dependencies=[Depends(require_api_key)]`. Verified for real: no key -> 401,
+wrong key -> 401, right key -> 200 with the correct answer. Known limits: one
+shared key (no per-caller identity), rotation means editing `.env` and
+restarting, no `/health` route, and HTTPS must come from a proxy/load balancer.
+
 `DATABASE_URL` is set in `.env`.
 
 ## Planned build order
@@ -482,9 +492,31 @@ package markers are omitted from both (see the Maintenance instructions below).
     retry-vs-proceed logic, all three external systems — Bedrock/Neon/
     SQLite — the two-pool retrieval + table-selection nuance inside
     `retrieve_node`/`generate_sql_node`, the offline ingestion pipeline,
-    the HTTP layer, and the deliberate absence of caching), and provides a
-    corrected Mermaid flowchart covering the full request path plus the
-    separate offline ingestion path.
+    the HTTP layer, and the deliberate absence of caching).
+    **Corrected post-hoc, then reverted**: first version was one dense
+    all-in-one Mermaid diagram with external-system connections drawn as
+    dotted lines crossing subgraphs. Tried restructuring into layers (a
+    4-box "big picture" diagram, a simple 6-step pipeline diagram, a
+    table instead of more crossing lines for external-system calls, a
+    separate small ingestion diagram) after the user called the original
+    too complex to scale — but the user preferred the original single
+    all-in-one diagram after seeing both, and asked for it back. Current
+    file is the original single-diagram version.
+    **Added, purely additive**: also bumped the diagram's Mermaid
+    `%%{init: ...}%%` font size/spacing (readable-text request, not a
+    content change), then added a second, separate diagram — "Sequential
+    flow (single column, step by step)" — the same system redrawn as one
+    strict top-to-bottom column with every graph node, database, and LLM
+    call in the actual order they happen, DB/LLM calls placed inline
+    rather than off to the side via dotted lines. Built with one real edge
+    chain plus a single invisible `~~~` ordering link (`N404 ~~~ RET`) —
+    the only spot a decision's two branches would otherwise land two
+    nodes side-by-side at the same rank. Nothing else in the file was
+    touched, per explicit instruction to leave the existing diagram as-is.
+33. `app/core/auth.py` — added post-build: `require_api_key` FastAPI dependency
+    comparing the `X-API-Key` header to `Settings.api_key` with
+    `secrets.compare_digest`, 401 on mismatch. Attached to the router in `routes.py`.
+    `config.py` also gained `api_key` (required `API_KEY` env var).
 
 (Package markers actually created, for completeness, but untracked by the
 numbering above: `app/__init__.py`, `app/core/__init__.py`,

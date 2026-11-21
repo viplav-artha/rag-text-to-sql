@@ -58,6 +58,7 @@ What's missing — this doc adds it back:
 ## Corrected architecture diagram
 
 ```mermaid
+%%{init: {"themeVariables": {"fontSize": "26px"}, "flowchart": {"rankSpacing": 80}}}%%
 flowchart TD
     Client["Client (Postman / curl)"] -->|"POST /query { question }"| API["FastAPI: POST /query"]
     API --> QS["query_service.run_query()"]
@@ -130,3 +131,40 @@ flowchart TD
   `nodes.py`, `TABLES` in `data/companies/futwork.py`) are built to hold
   more than one entry without further code changes, but only Futwork/one
   table exist right now.
+
+## Sequential flow (single column, step by step)
+
+Same system, drawn a different way: every node — graph step, database, or
+LLM call — in one straight top-to-bottom column, in the exact order it
+happens during a real request. Useful for tracing "what happens right after
+this" without your eye jumping between subgraphs.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "26px"}, "flowchart": {"rankSpacing": 80}}}%%
+flowchart TD
+    Client["Client\n(Postman / curl)"] --> API["FastAPI\nPOST /query"]
+    API --> QS["query_service.run_query()"]
+    QS --> STARTN(("START"))
+    STARTN --> DC["detect_company_node"]
+    DC --> BED1[["AWS Bedrock\nLLM call: pick company"]]
+    BED1 --> DEC1{"company\nfound?"}
+    DEC1 -->|"not found"| N404["404 Unknown company"]
+    DEC1 -->|"found"| RET["retrieve_node"]
+    N404 -->|"404 response"| ClientEnd["Client\nreceives response"]
+    RET --> EMB[["sentence-transformers\nembed question (local)"]]
+    EMB --> SQL[("Local SQLite\nrag_store.db")]
+    SQL --> GEN["generate_sql_node"]
+    GEN --> BED2[["AWS Bedrock\nLLM call: pick table + write SQL"]]
+    BED2 --> VAL["validate_sql_node\n(rules only, no LLM)"]
+    VAL --> DEC2{"SQL\nvalid?"}
+    DEC2 -->|"invalid AND retries left (< 2)"| GEN
+    DEC2 -->|"valid, or retries exhausted"| EXE["execute_sql_node"]
+    EXE --> NEON[("Neon Postgres\nportfolio.futwork_vs_aop")]
+    NEON --> FMT["format_answer_node"]
+    FMT --> BED3[["AWS Bedrock\nLLM call: narrate answer"]]
+    BED3 --> ENDN(("END"))
+    ENDN --> OK200["200 OK\nQueryResponse"]
+    OK200 --> ClientEnd
+
+    N404 ~~~ RET
+```

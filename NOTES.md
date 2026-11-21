@@ -105,6 +105,10 @@ study and are omitted here). Each node is numbered by creation order.
 [32] ARCHITECTURE.md (post-build, docs-only — reviews a hand-drawn diagram
      and adds a corrected Mermaid architecture diagram; no code, so no
      Routes Graph node)
+     |
+     v
+[33] app/core/auth.py (post-build, static API key check via the X-API-Key
+     header; config.py gained `api_key` in the same step)
 ```
 
 ## Routes Graph (import / dependency connections)
@@ -199,6 +203,9 @@ graph TD
     n22["[29] app/rag/vector_utils.py"]
     n22 -->|VectorJSON, cosine_similarity| n6
     n22 -->|VectorJSON, cosine_similarity| n7
+    n23["[30] app/core/auth.py"]
+    n2 -->|get_settings| n23
+    n23 -->|require_api_key| n21
 ```
 
 ## File notes
@@ -1244,6 +1251,43 @@ chat and in CLAUDE.md, not here).
   inside `generate_sql_node`; the offline `scripts/ingest_knowledge.py`
   pipeline that populates the SQLite store (never part of a live
   request); the FastAPI HTTP layer; and the deliberate absence of a
-  caching layer. Contains one corrected Mermaid `flowchart TD` covering
-  the full request path (client → FastAPI → LangGraph → external systems
-  → response) plus a separate subgraph for the offline ingestion path.
+  caching layer.
+  **Corrected post-hoc, then reverted**: the first version packed all of
+  that into one dense Mermaid diagram, with dotted lines for
+  external-system calls crossing subgraph boundaries. After the user
+  flagged this as too complex to scale, tried restructuring into layers
+  — a 4-box "big picture" diagram, a plain 6-step pipeline diagram with
+  nothing else cluttering it, a markdown table instead of more crossing
+  lines for external-system calls, a small separate ingestion diagram,
+  and the hand-drawn-diagram comparison moved to an appendix. The user
+  compared both and preferred the original single all-in-one diagram,
+  and asked for it back — current file is that original version.
+  Worth remembering: this user's actual preference, tested against a
+  real alternative, is one comprehensive diagram over several simpler
+  layered ones, even for a file explicitly flagged as "a bit complex."
+  **Added, purely additive**: bumped the existing diagram's Mermaid
+  `%%{init: ...}%%` font size to `26px` and `rankSpacing` to `80` (a
+  legibility fix, no content change), then added a second section,
+  "Sequential flow (single column, step by step)" — the same request
+  path redrawn as one strict top-to-bottom column with every node
+  (graph step, database, LLM call) stacked in the exact order it
+  happens, DB/LLM calls placed inline in the sequence rather than
+  branching off to the side. To force a genuinely single-column layout
+  in Mermaid despite two decision branch points, the trick used: define
+  one real, mostly-linear edge chain (which fixes every node's vertical
+  rank), then add exactly one invisible ordering link (`N404 ~~~ RET`)
+  at the single spot where a decision's two branches would otherwise
+  place two nodes at the same rank side-by-side. Nothing else in the
+  file changed, per explicit instruction to leave the existing diagram
+  as-is.
+
+### [33] app/core/auth.py (Routes Graph node 23)
+- Motive: `/query` was reachable by anyone who could hit the server, which
+  allowed unauthenticated use of the Bedrock and Neon resources. A single
+  reusable check rejects those requests before the pipeline starts.
+- Logic: `require_api_key` reads the `X-API-Key` header (via `APIKeyHeader`,
+  `auto_error=False`) and compares it to `get_settings().api_key` with
+  `secrets.compare_digest`. A missing or wrong key raises HTTP 401. Attached
+  to the router in `app/api/routes.py` via `APIRouter(dependencies=[Depends(require_api_key)])`. `config.py` now loads
+  `API_KEY` into `Settings.api_key` and raises `ValueError` at first settings
+  load if it is unset.

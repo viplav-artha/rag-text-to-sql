@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.auth import require_api_key
 from app.api.schemas import QueryRequest, QueryResponse
 from app.services.query_service import run_query
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_api_key)])
 
 
 @router.post("/query", response_model=QueryResponse)
